@@ -93,7 +93,7 @@ jobs:
           version=$(python3 -c "import xml.etree.ElementTree as ET;print(ET.parse('Directory.Build.props').getroot().findtext('.//Version'))")
           "$bt/apksigner" sign --ks release.jks --ks-key-alias betterendfield \
             --ks-pass pass:betterendfield --key-pass pass:betterendfield \
-            --out "BetterEndfieldNext-$version-arm64-xposed.apk" aligned.apk
+            --out "BetterEndfieldNext-$version-arm64-lsposed.apk" aligned.apk
           ls -lh *.apk
 
       - name: Publish APK
