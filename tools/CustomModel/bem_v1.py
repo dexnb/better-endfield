@@ -1,0 +1,577 @@
+"""BEM 1.0/1.1/1.2/1.3/1.4 container and v1.0 migration.
+
+The manifest is data, never executable. Payload IDs are directory indices.
+"""
+from __future__ import annotations
+import copy
+import json
+import re
+import struct
+import zlib
+from pathlib import Path
+import zstd_compat  # noqa: F401  - stdlib stand-in when the zstandard extension is absent
+import zstandard as zstd
+
+MAGIC = b'BEM\x00PKG\x00'
+HEADER = struct.Struct('<8sHHIQQII')
+ENTRY = struct.Struct('<IIQQQ')
+LIMIT = 512 * 1024 * 1024
+ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$')
+CAPABILITIES = ['native-materials', 'palette-u8', 'indices-u32', 'fixed-appearances']
+SUPPORTED_CAPABILITIES = CAPABILITIES + ['texture-astc', 'material-overrides-v1', 'root-offset-v1',
+                                         'dynamic-drivers-v1']
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def identity(value):
+    require(isinstance(value, str) and ID.fullmatch(value), f'Invalid stable ID: {value!r}')
+    return value
+
+
+def crc(text):
+    return zlib.crc32(text.encode('utf-8'))
+
+
+def load_json(path):
+    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+
+
+def atomic_write(path, data):
+    import os
+    import tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+GAME_BASELINE_PLATFORMS = ('windows-x64', 'android-arm64')
+# Single value for both platforms: a hotfix belongs to the distribution batch, not
+# to one platform. It is a counter starting at 0 (0 = no hotfix) so two otherwise
+# identically numbered baselines stay distinguishable in the fix table.
+GAME_BASELINE_HOTFIX = 'hotfix'
+
+
+def validate_game_baseline(m):
+    """Section 15: optional root-level game version baseline.
+
+    Absence is valid and must stay valid: older packages never carry the field and
+    readers must not reject them. When present all three keys are required: both
+    platforms plus the `hotfix` counter. Version formats stay advisory because game
+    version identifiers may change, but the counter is ours, so it is numeric.
+    """
+    if 'game_baseline' not in m:
+        return
+    baseline = m['game_baseline']
+    require(isinstance(baseline, dict), 'game_baseline must be an object')
+    required = set(GAME_BASELINE_PLATFORMS) | {GAME_BASELINE_HOTFIX}
+    require(set(baseline) == required,
+            'game_baseline requires exactly windows-x64, android-arm64 and hotfix')
+    for platform in GAME_BASELINE_PLATFORMS:
+        value = baseline[platform]
+        require(isinstance(value, str) and value, 'game_baseline values must be non-empty strings')
+        require(len(value.encode('utf-8')) <= 64, 'game_baseline value exceeds 64 bytes')
+        require(all(0x20 <= ord(ch) <= 0x7e for ch in value),
+                'game_baseline values must be printable ASCII')
+    hotfix = baseline[GAME_BASELINE_HOTFIX]
+    # Accept the natural JSON spelling of a counter as well as its string form.
+    if isinstance(hotfix, int) and not isinstance(hotfix, bool):
+        require(0 <= hotfix <= 0xffffffff, 'game_baseline hotfix must be a non-negative integer')
+        return
+    require(isinstance(hotfix, str) and hotfix.isdigit() and len(hotfix) <= 10,
+            'game_baseline hotfix must be a non-negative integer, starting at 0')
+
+
+def parse_game_baseline(spec):
+    """Accept 'windows-x64=1.6.3,android-arm64=1.6.4[,hotfix=hf2]' or a built mapping."""
+    if spec is None:
+        return None
+    if isinstance(spec, dict):
+        value = dict(spec)
+    elif isinstance(spec, str):
+        value = {}
+        for part in spec.split(','):
+            part = part.strip()
+            require(part, 'Empty game_baseline entry')
+            require('=' in part, 'game_baseline entry must be key=value')
+            key, item = part.split('=', 1)
+            key, item = key.strip(), item.strip()
+            require(key not in value, 'Duplicate game_baseline key: ' + key)
+            value[key] = item
+    else:
+        raise ValueError('game_baseline must be a mapping or a key=value string')
+    validate_game_baseline({'game_baseline': value})
+    return value
+
+
+def require_game_baseline(m, explicit=None, catalog=None):
+    """Write-side rule: explicit argument > catalog `game` > existing manifest value > refuse.
+
+    Read-side validation stays inside `validate_game_baseline`, which tolerates
+    absence; only new packages must carry the field. An editable project that
+    already declares a baseline keeps it, so unpack/pack round-trips do not force
+    the author to retype it.
+    """
+    baseline = parse_game_baseline(explicit)
+    if baseline is None and isinstance(catalog, dict) and catalog.get('game') is not None:
+        candidate = catalog['game']
+        validate_game_baseline({'game_baseline': candidate})
+        baseline = dict(candidate)
+    if baseline is None and 'game_baseline' in m:
+        validate_game_baseline(m)
+        return m['game_baseline']
+    require(baseline is not None,
+            'game_baseline is required for new packages; pass '
+            '--game-baseline windows-x64=1.6.3,android-arm64=1.6.4,hotfix=0')
+    m['game_baseline'] = baseline
+    return baseline
+
+
+def validate_manifest(m, payload_count, minor=None):
+    """`minor` is the header minor; None validates composable content under the newest limits."""
+    # Match native numeric/string bounds before Python indexing (negative indexes
+    # must never silently select the last donor or resource).
+    def tree(value, depth=0, allow_float=False):
+        require(depth <= 48, 'Manifest nesting exceeds 48')
+        if isinstance(value, dict):
+            for k, v in value.items():
+                tree(v, depth+1, allow_float or k in (
+                    'material_overrides', 'floats', 'colors', 'vectors', 'translation',
+                    # Section 13 clock parameters are fractional by nature and are
+                    # validated field by field in bem_v15.
+                    'drivers'))
+        elif isinstance(value, list):
+            for v in value: tree(v, depth+1, allow_float)
+        elif type(value) in (int, float):
+            if allow_float and isinstance(value, (int, float)):
+                import math
+                require(math.isfinite(value), 'Manifest floats must be finite')
+            else:
+                require(type(value) is int and 0 <= value <= 0xffffffff, 'Manifest integers must be UInt32')
+        elif isinstance(value, str):
+            require('\0' not in value, 'NUL in manifest string')
+    tree(m)
+    # Version-independent, so it runs before the per-version dispatch below.
+    validate_game_baseline(m)
+    if minor == 5:
+        import bem_v15
+        return bem_v15.validate_manifest(m, payload_count, minor)
+    if minor is None:
+        import bem_v15
+        if bem_v15.used(m):
+            return bem_v15.validate_manifest(m, payload_count, minor)
+    import bem_v14
+    if minor == 4 or bem_v14.used(m):
+        return bem_v14.validate_manifest(m, payload_count, minor)
+    if 'option_groups' in m:
+        import bem_v13
+        if minor == 3 or bem_v13.used(m):
+            return bem_v13.validate_manifest(m, payload_count, minor)
+        import bem_v11
+        return bem_v11.validate_manifest(m, payload_count, minor)
+    require(not m.get('parameters') and not m.get('mesh_deformations'),
+            'Body parameters require a BEM 1.3 composable project')
+    require(not m.get('texture_slots') and not any(c.get('bone_name_aliases') for c in m['target']['components']),
+            'Extended resources require a BEM 1.2 composable project')
+    require(m['schema'] == 1, 'Unsupported manifest schema')
+    for key in ('package_id', 'default_appearance_id'):
+        identity(m[key])
+    for key in ('name', 'author', 'version'):
+        require(isinstance(m[key], str) and 0 < len(m[key].encode('utf-8')) <= 256, f'Invalid {key}')
+    require(set(m['required_capabilities']) <= set(SUPPORTED_CAPABILITIES), 'Unsupported required capability')
+    t = m['target']
+    for key in ('character_id', 'profile_id', 'revision', 'world_resource', 'ui_resource'):
+        identity(t[key])
+    require(t['platform'] == 'windows-x64', 'BEM runtime currently supports windows-x64 only')
+    require(t['world_resource'] != t['ui_resource'], 'Duplicate resource roots')
+    require(0 < len(t['components']) <= 64, 'Expected 1..64 target components')
+    for i, c in enumerate(t['components']):
+        require(c['id'] == i and c['original_index_count'] > 0 and c['original_index_count'] % 3 == 0,
+                'Target IDs must be contiguous and original counts triangular')
+        require(isinstance(c['mesh_name'], str) and 0 < len(c['mesh_name']) <= 256, 'Invalid mesh identity')
+        require(len(c['bone_names']) <= 65536 and len(c['materials']) <= 256, 'Donor table exceeds runtime limits')
+    require(len({c['mesh_name'] for c in t['components']}) == len(t['components']), 'Duplicate mesh identity')
+    def ref(n):
+        require(type(n) is int and 0 <= n < payload_count, 'Payload reference outside directory')
+    for mesh in m['meshes']:
+        require(len(mesh['streams']) == 3, 'Three native streams required')
+        for s in mesh['streams']:
+            ref(s['payload'])
+            require(0 < s['stride'] <= 64, 'Unsupported stride')
+        ref(mesh['indices'])
+        require(mesh['index_size'] in (2, 4), 'Unsupported index size')
+        require(0 < mesh['vertex_count'] <= 1048576 and 0 < mesh['index_count'] <= 16777216,
+                'Geometry exceeds runtime limits')
+        require(0 < len(mesh['bones']) <= 256 and 0 < len(mesh['draws']) <= 256, 'Palette/draw limit exceeded')
+        attrs = mesh['attributes']
+        require(0 < len(attrs) <= 16, 'Invalid native vertex declaration')
+        offsets = [0, 0, 0]
+        seen = set()
+        sizes = [4, 2, 1, 1, 2, 2, 1, 1, 2, 2, 4, 4]
+        for a in attrs:
+            require(len(a) == 5, 'Attribute requires semantic/format/dimension/stream/offset')
+            semantic, fmt, dim, stream, off = a
+            require(0 <= semantic <= 13 and semantic not in seen and 0 <= fmt < len(sizes)
+                    and 1 <= dim <= 4 and 0 <= stream < 3 and off == offsets[stream], 'Invalid attribute')
+            seen.add(semantic)
+            offsets[stream] += sizes[fmt] * dim
+        require(offsets == [s['stride'] for s in mesh['streams']], 'Attributes disagree with stream strides')
+        require(attrs[-1][:4] == [13, 6, 4, 2], 'Skin indices must be UINT8x4 at end of stream 2')
+        skin_attrs = [a for a in attrs if a[3] == 2]
+        expected_skin = [[13,6,4,2,0]] if offsets[2] == 4 else [[12,4,4,2,0],[13,6,4,2,8]]
+        require(skin_attrs == expected_skin, 'Unsupported native skin declaration')
+        for bone in mesh['bones']:
+            donor = t['components'][bone['component']]
+            require(donor['bone_names'][bone['index']] == bone['name'], 'Bone identity differs from target')
+        end = 0
+        for d in mesh['draws']:
+            require(d['start'] == end and d['count'] > 0 and d['count'] % 3 == 0, 'Draws must partition IB')
+            end += d['count']
+            require(t['components'][d['material_component']]['materials'][d['material_slot']] == d['material_name'],
+                    'Material identity differs from target')
+            require(len(set(d['textures'])) == len(d['textures']), 'Duplicate draw texture')
+            for n in d['textures']:
+                require(0 <= n < len(m['textures']), 'Missing texture binding')
+        require(end == mesh['index_count'], 'Draws do not cover IB')
+    for t in m['textures']:
+        ref(t['payload'])
+        require(t['format'] in (4, 10, 12, 25, 26, 27, 48, 49, 50, 63), 'Unsupported texture format')
+        require(t['format'] != 63 or t['srgb'] is False, 'R8 texture must be linear')
+        require(type(t['srgb']) is bool, 'Texture srgb must be boolean')
+        require(isinstance(t['original_name'], str) and 0 < len(t['original_name']) <= 256, 'Missing texture identity')
+    appearances = m['appearances']
+    require(0 < len(appearances) <= 64, 'Expected 1..64 appearances')
+    require(len({identity(a['id']) for a in appearances}) == len(appearances), 'Duplicate appearance ID')
+    require(m['default_appearance_id'] in [a['id'] for a in appearances], 'Default appearance missing')
+    for a in appearances:
+        require(isinstance(a['name'], str) and 0 < len(a['name']) <= 256, 'Invalid appearance name')
+        require([c['target'] for c in a['components']] == list(range(len(m['target']['components']))),
+                'Appearance must specify every target component in order')
+        for c in a['components']:
+            require(c['operation'] in ('keep', 'hide', 'replace'), 'Unknown component operation')
+            require('material_overrides' not in c, 'Keep material overrides require BEM 1.1')
+            if c['operation'] == 'replace':
+                require(0 <= c['mesh'] < len(m['meshes']), 'Missing mesh')
+        if 'preview' in a:
+            ref(a['preview'])
+
+
+def write_package(path, manifest, payloads):
+    validate_manifest(manifest, len(payloads))
+    manifest = copy.deepcopy(manifest)
+    unique, mapping = [], []
+    for data in payloads:
+        index = next((i for i, old in enumerate(unique) if old == data), None)
+        if index is None:
+            index = len(unique); unique.append(data)
+        mapping.append(index)
+    composable = 'option_groups' in manifest
+    minor = 0
+    if composable:
+        import bem_v11
+        summary = bem_v11.analyze_selection_space(manifest, payloads)
+        minor = bem_v11.required_minor(manifest, summary, len(unique))
+    for mesh in manifest['meshes']:
+        if composable:
+            for draw in mesh['draws']:
+                draw['indices'] = mapping[draw['indices']]
+        else:
+            mesh['indices'] = mapping[mesh['indices']]
+        for stream in mesh['streams']:
+            stream['payload'] = mapping[stream['payload']]
+    for texture in manifest['textures']:
+        texture['payload'] = mapping[texture['payload']]
+    for channel in manifest.get('mesh_deformations', []):
+        for frame in channel['frames']:
+            if 'payload' in frame:
+                frame['payload'] = mapping[frame['payload']]
+    if not composable:
+        for appearance in manifest['appearances']:
+            if 'preview' in appearance:
+                appearance['preview'] = mapping[appearance['preview']]
+    payloads = unique
+    # Deduplication changes directory IDs; validate the remapped manifest under
+    # the actual header limits, rather than comparing old IDs with the new count.
+    if composable: validate_manifest(manifest, len(payloads), minor)
+    raw = json.dumps(manifest, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+    require(len(raw) <= 4 * 1024 * 1024 and len(payloads) <= (16384 if minor >= 2 else 4096),
+            'Manifest/directory too large')
+    pos = HEADER.size + len(raw) + ENTRY.size * len(payloads)
+    entries, blocks = [], []
+    compressor = zstd.ZstdCompressor(level=9)
+    for data in payloads:
+        require(0 < len(data) <= LIMIT, 'Invalid payload length')
+        packed = compressor.compress(data)
+        codec = 1 if len(packed) < len(data) else 0
+        block = packed if codec else data
+        entries.append(ENTRY.pack(codec, 0, pos, len(block), len(data)))
+        blocks.append(block)
+        pos += len(block)
+    require(pos <= 2 * 1024**3, 'Package exceeds 2 GiB')
+    atomic_write(path, HEADER.pack(MAGIC, 1, minor, HEADER.size, pos, len(raw), len(entries), 0)
+                 + raw + b''.join(entries) + b''.join(blocks))
+
+
+def _insert_after_open_brace(raw, fragment):
+    """Insert JSON `fragment` right after the manifest's opening brace.
+
+    Every other manifest byte is preserved, so a rewrite cannot reformat numbers,
+    reorder keys or change escaping. BEM manifests are always UTF-8 without a BOM,
+    matching `read_package`.
+    """
+    pos = 0
+    while pos < len(raw) and raw[pos] in b' \t\r\n':
+        pos += 1
+    require(pos < len(raw) and raw[pos:pos + 1] == b'{', 'Manifest does not open with an object')
+    empty = raw[pos + 1:].lstrip(b' \t\r\n').startswith(b'}')
+    return raw[:pos + 1] + fragment + (b'' if empty else b',') + raw[pos + 1:]
+
+
+def set_game_baseline(path, baseline, output=None, validate=True):
+    """Backfill `game_baseline` into an existing package without re-encoding payloads.
+
+    Only the two size fields in the header and every payload offset move; payload
+    blocks are copied byte for byte. That keeps a large package to one sequential
+    copy instead of a decode/re-encode cycle, and it cannot change rendering.
+
+    Returns False when the package already declares the field, so repeated
+    backfills stay idempotent. `output` writes beside the original; omitting it
+    replaces the file in place once the result reads back.
+    """
+    validate_game_baseline({'game_baseline': baseline})
+    normalized = dict(baseline)
+    normalized['hotfix'] = int(normalized['hotfix'])
+    path = Path(path)
+    target = Path(output) if output is not None else path
+    import os
+    import shutil
+    import tempfile
+    with path.open('rb') as source:
+        header = source.read(HEADER.size)
+        require(len(header) == HEADER.size, 'Truncated BEM header')
+        magic, major, minor, header_size, file_size, manifest_size, count, flags = HEADER.unpack(header)
+        require(magic == MAGIC and major == 1 and header_size == HEADER.size and not flags,
+                'Unsupported BEM header')
+        require(0 < manifest_size <= 4 * 1024 * 1024, 'Invalid BEM manifest size')
+        raw = source.read(manifest_size)
+        require(len(raw) == manifest_size, 'Truncated BEM manifest')
+        table = source.read(ENTRY.size * count)
+        require(len(table) == ENTRY.size * count, 'Truncated payload directory')
+        manifest = json.loads(raw.decode('utf-8'))
+        if 'game_baseline' in manifest:
+            return False
+        if validate:
+            validate_manifest(manifest, count, minor or None)
+        entries = list(ENTRY.iter_unpack(table))
+        payload_start = HEADER.size + manifest_size + ENTRY.size * count
+        cursor = payload_start
+        for codec, reserved, offset, stored, decoded in entries:
+            require(codec in (0, 1) and not reserved and offset == cursor and 0 < stored
+                    and stored <= file_size - cursor, 'Invalid payload directory')
+            cursor += stored
+        require(cursor == file_size, 'Trailing or missing package bytes')
+        fragment = json.dumps({'game_baseline': normalized}, ensure_ascii=True,
+                              separators=(',', ':')).encode('utf-8')[1:-1]
+        rewritten = _insert_after_open_brace(raw, fragment)
+        require(len(rewritten) <= 4 * 1024 * 1024, 'Manifest too large after backfill')
+        require(json.loads(rewritten.decode('utf-8')).get('game_baseline') == normalized,
+                'Backfilled manifest does not read back')
+        delta = len(rewritten) - manifest_size
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=target.name + '.', suffix='.tmp')
+        os.close(handle)
+        try:
+            with open(temporary, 'wb') as destination:
+                destination.write(HEADER.pack(MAGIC, 1, minor, HEADER.size, file_size + delta,
+                                              len(rewritten), count, 0))
+                destination.write(rewritten)
+                position = payload_start + delta
+                for codec, reserved, offset, stored, decoded in entries:
+                    destination.write(ENTRY.pack(codec, reserved, position, stored, decoded))
+                    position += stored
+                # The source sits exactly at the first payload block; copy it as is.
+                shutil.copyfileobj(source, destination, 1024 * 1024)
+            if validate:
+                read_package(temporary, decode=False)
+            # Windows refuses to replace a file that is still open for reading.
+            source.close()
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return True
+
+
+def package_minor(path):
+    """Header minor version (0..4: 1.0..1.4) without reading the manifest."""
+    with Path(path).open('rb') as f:
+        h = f.read(HEADER.size)
+    require(len(h) == HEADER.size, 'Truncated BEM header')
+    magic, major, minor = HEADER.unpack(h)[:3]
+    require(magic == MAGIC and major == 1 and minor in (0, 1, 2, 3, 4, 5), 'Unsupported BEM header/version')
+    return minor
+
+
+def read_package(path, decode=True):
+    with Path(path).open('rb') as f:
+        size = f.seek(0, 2); f.seek(0)
+        h = f.read(HEADER.size)
+        require(len(h) == HEADER.size, 'Truncated BEM header')
+        magic, major, minor, hs, fs, ms, count, flags = HEADER.unpack(h)
+        require(magic == MAGIC and major == 1 and minor in (0, 1, 2, 3, 4, 5) and hs == HEADER.size and not flags,
+                'Unsupported BEM header/version')
+        require(fs == size and fs <= 2 * 1024**3 and 0 < ms <= 4 * 1024**2 and
+                count <= (16384 if minor >= 2 else 4096), 'Invalid BEM sizes')
+        def no_duplicates(pairs):
+            d = {}
+            for k, v in pairs:
+                require(k not in d, 'Duplicate JSON key')
+                d[k] = v
+            return d
+        m = json.loads(f.read(ms).decode('utf-8'), object_pairs_hook=no_duplicates)
+        require(('option_groups' in m) == (minor >= 1), 'BEM version/manifest mismatch')
+        table = f.read(count * ENTRY.size)
+        require(len(table) == count * ENTRY.size, 'Truncated payload directory')
+        entries = list(ENTRY.iter_unpack(table))
+        end = HEADER.size + ms + len(table)
+        for codec, reserved, off, stored, decoded in entries:
+            require(codec in (0, 1) and not reserved and off == end and 0 < stored <= LIMIT
+                    and 0 < decoded <= LIMIT and stored <= fs - off, 'Invalid payload directory')
+            require(codec or stored == decoded, 'Raw payload size mismatch')
+            end += stored
+        require(end == fs, 'Trailing/missing package bytes')
+        validate_manifest(m, count, minor or None)
+        payloads = []
+        if decode:
+            require(sum(e[4] for e in entries) <= 2 * 1024**3, 'Decoded package exceeds tool budget')
+            for codec, _, off, stored, decoded in entries:
+                f.seek(off); data = f.read(stored)
+                if codec:
+                    require(zstd.frame_content_size(data) == decoded, 'Zstd content size mismatch')
+                    data = zstd.ZstdDecompressor().decompress(data, max_output_size=decoded, allow_extra_data=False)
+                require(len(data) == decoded, 'Decoded length differs')
+                payloads.append(data)
+        return m, payloads
+
+
+class Builder:
+    def __init__(self, package_id, name, author, version, target, catalog=None):
+        self.m = dict(schema=1, package_id=identity(package_id), name=name, author=author, version=version,
+                      required_capabilities=CAPABILITIES, target=target, default_appearance_id='',
+                      appearances=[], meshes=[], textures=[])
+        self.payloads = []
+        # Source catalog entry, when the builder was created from one. Section 15
+        # reads `catalog['game']` to fill the baseline; it is never serialized here.
+        self.catalog = catalog
+
+    def payload(self, data):
+        # Exact byte equality; no artifact hashes or collision-based identity.
+        for i, old in enumerate(self.payloads):
+            if old == data:
+                return i
+        self.payloads.append(bytes(data))
+        return len(self.payloads) - 1
+
+    def add_legacy(self, raw, profile, appearance_id, name):
+        """Migrate verified v25 or fully described v24; no layout/material guessing."""
+        pos = 0
+        def take(n):
+            nonlocal pos
+            require(n >= 0 and n <= len(raw) - pos, 'Truncated legacy package')
+            b = raw[pos:pos+n]; pos += n
+            return b
+        magic, version, nc, nt, _, _ = struct.unpack('<8s5I', take(28))
+        require((version, magic) in ((24, b'BEMPC24\0'), (25, b'BEMPC25\0')), 'Expected BEMPC24/25')
+        require(nc == len(self.m['target']['components']) and nt <= 32, 'Legacy component/texture count differs')
+        operations, pending = [], []
+        texture_base = len(self.m['textures'])
+        for expected_id in range(nc):
+            cid, orig, vc, ic, maxbone, sc, s0, s1, s2, iz, nb, flags, nd = struct.unpack('<13I', take(52))
+            native = profile['components'][str(cid)]
+            require(cid == expected_id and orig == native['original_index_count'], 'Legacy target mismatch')
+            operation = 'hide' if flags & 1 else 'keep' if flags & 2 else 'replace'
+            op = dict(target=cid, operation=operation)
+            if flags & 2:
+                operations.append(op); continue
+            require(sc == 3 and [s0,s1,s2] == native['strides'], 'Missing/mismatched verified native strides')
+            streams = [dict(stride=s, payload=self.payload(take(vc*s))) for s in (s0,s1,s2)]
+            indices = self.payload(take(ic*iz))
+            attrs, offsets = [], [0,0,0]
+            sizes = [4,2,1,1,2,2,1,1,2,2,4,4]
+            for a in native['attributes']:
+                sem, fmt, dim, stream = a
+                attrs.append([*a, offsets[stream]])
+                offsets[stream] += sizes[fmt]*dim
+            bones, draws = [], []
+            if version == 25:
+                layout, = struct.unpack('<I', take(4))
+                require(layout == zlib.crc32(b''.join(struct.pack('<4i', *a) for a in native['attributes'])),
+                        'Legacy declaration differs from supplied profile')
+                for _ in range(nb):
+                    donor, index, pin = struct.unpack('<3I', take(12))
+                    bn = profile['components'][str(donor)]['bone_names'][index]
+                    require(crc(bn) == pin, 'Legacy bone name differs')
+                    bones.append(dict(component=donor, index=index, name=bn))
+                for _ in range(nd):
+                    start, count, donor, slot, pin, mask = struct.unpack('<6I', take(24))
+                    mn = profile['components'][str(donor)]['materials'][slot]
+                    require(crc(mn) == pin, 'Legacy material name differs')
+                    draws.append(dict(start=start, count=count, material_component=donor, material_slot=slot,
+                                      material_name=mn, textures=[texture_base+t for t in range(nt) if mask & (1<<t)]))
+            else:
+                mapping = native.get('v24_draws')
+                require(mapping, f'C{cid}: v24 migration needs explicit v24_draws material/texture mapping')
+                bones = [dict(component=cid, index=i, name=native['bone_names'][i]) for i in range(maxbone+1)]
+                draws = copy.deepcopy(mapping)
+                for d in draws:
+                    d['material_name'] = profile['components'][str(d['material_component'])]['materials'][d['material_slot']]
+                    d['textures'] = [texture_base+t for t in d['textures']]
+            mesh = dict(vertex_count=vc, index_count=ic, index_size=iz, streams=streams, indices=indices,
+                        attributes=attrs, bones=bones, draws=draws)
+            if operation == 'replace':
+                op['mesh'] = len(self.m['meshes']); self.m['meshes'].append(mesh)
+            operations.append(op)
+        # Names are supplied by reviewed material rules; CRC alone is not a v1 identity.
+        names = set(profile.get('texture_names', []))
+        for entry in profile.get('entries', {}).values():
+            for rule in entry.get('material_rules', []):
+                names.update(t['original_texture'] for t in rule.get('textures', []))
+        for _ in range(nt):
+            w,h,mips,size,fmt,srgb,sfmt,ssrgb,mask,pin,nl,kind = struct.unpack('<4I4iIi2I', take(48))
+            take(nl)
+            matches = [n for n in names if crc(n) == (pin & 0xffffffff)]
+            require(kind == 2 and len(matches) == 1, 'Migration requires unambiguous original texture name')
+            self.m['textures'].append(dict(width=w,height=h,mips=mips,format=fmt,srgb=bool(srgb),
+                                           original_name=matches[0],payload=self.payload(take(size))))
+        require(pos == len(raw), 'Legacy package has trailing bytes')
+        self.m['appearances'].append(dict(id=identity(appearance_id), name=name, description='', components=operations))
+        if not self.m['default_appearance_id']:
+            self.m['default_appearance_id'] = appearance_id
+
+    def write(self, path):
+        write_package(path, self.m, self.payloads)
+
+
+def target_from_profile(profile, character_id, world, ui, profile_id, revision):
+    require(profile.get('verified') is True, 'A verified native profile is required')
+    components = []
+    for key, c in sorted(profile['components'].items(), key=lambda kv: int(kv[0])):
+        component = dict(id=int(key), mesh_name=c['mesh_name'], original_index_count=c['original_index_count'],
+                         bone_names=c['bone_names'], materials=c['materials'])
+        if c.get('bone_name_aliases'):
+            # BEM 1.2: the manifest must also declare 'resource-bone-aliases'.
+            component['bone_name_aliases'] = c['bone_name_aliases']
+        components.append(component)
+    return dict(character_id=character_id, platform='windows-x64', profile_id=profile_id, revision=revision,
+                snapshot=profile.get('source_snapshot', {}).get('manifest_version', ''),
+                world_resource=world, ui_resource=ui, components=components)

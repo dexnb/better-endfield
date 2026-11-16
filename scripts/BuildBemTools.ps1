@@ -1,0 +1,143 @@
+[CmdletBinding()]
+param(
+    [string]$Destination = "",
+    [string]$WorkspaceConfig = "",
+    [string]$ArchiveBackend = "",
+
+    # Set by scripts/ci/*.ps1: the tools are signed on the release host together
+    # with everything else, so an agent has no certificate to sign with.
+    [switch]$SkipSigning,
+
+    # The DSH bundle is a separate release asset owned by its own job; the job
+    # that builds the player does not need it and should not pay for the CLI
+    # tree it requires.
+    [switch]$SkipDshPlugin
+)
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'Workspace.ps1')
+$ws = Get-BEWorkspace -Config $WorkspaceConfig
+Set-BEWorkspaceEnvironment $ws
+$repo = $ws.repo_root
+$python = $ws.tools.python
+$dotnet = $ws.tools.dotnet
+if (-not (Get-Command $python -ErrorAction SilentlyContinue)) {
+    throw "Configured Python was not found: $python"
+}
+if (-not (Get-Command $dotnet -ErrorAction SilentlyContinue)) {
+    throw "Configured dotnet was not found: $dotnet"
+}
+if ([string]::IsNullOrWhiteSpace($ArchiveBackend)) {
+    $ArchiveBackend = if ($ws.tools.archive_backend) {
+        $ws.tools.archive_backend
+    } else {
+        Join-Path $ws.paths.toolchains 'bem-archive-backend\7zip'
+    }
+}
+$ArchiveBackend = [System.IO.Path]::GetFullPath($ArchiveBackend)
+& (Join-Path $PSScriptRoot 'PrepareBemArchiveBackend.ps1') `
+    -WorkspaceConfig $WorkspaceConfig -ArchiveBackend $ArchiveBackend
+if ([string]::IsNullOrWhiteSpace($Destination)) {
+    $Destination = Join-Path $ws.paths.build "tools\bem"
+}
+$Destination = [System.IO.Path]::GetFullPath($Destination)
+$toolVersionText = & $python (Join-Path $repo 'tools/CustomModel/bem_tool.py') --version
+if ($LASTEXITCODE -ne 0 -or ($toolVersionText -join ' ') -notmatch '(\d+\.\d+\.\d+)') {
+    throw 'BEM Tools version could not be resolved.'
+}
+$toolVersion = $Matches[1]
+# The standalone creator ZIP must carry the same native engine as the player.
+$composerBuild = Join-Path $ws.paths.build 'next\windows\win-x64\Release\native'
+& $ws.tools.cmake -S (Join-Path $repo 'native') -B $composerBuild -G 'Visual Studio 17 2022' -A x64
+if ($LASTEXITCODE -ne 0) { throw 'Native composer configuration failed.' }
+& $ws.tools.cmake --build $composerBuild --config Release --target BetterEndfieldNext.BemCompose --parallel 4
+if ($LASTEXITCODE -ne 0) { throw 'Native composer build failed.' }
+$composerDirectory = Join-Path $composerBuild 'stage\Release\tools\BemCompose'
+if (-not $SkipSigning) {
+    & (Join-Path $PSScriptRoot 'SignNextRelease.ps1') -Path $composerDirectory -WorkspaceConfig $WorkspaceConfig
+}
+# Creator tools are self-contained at runtime. Build dependencies are explicit.
+& $python -c "import PyInstaller, zstandard"
+if ($LASTEXITCODE -ne 0) { throw "Install tools/CustomModel/requirements-build.txt into the build Python environment first." }
+& $python -m PyInstaller --noconfirm --clean --onedir --console `
+    --name BetterEndfieldNext.BemConverter `
+    --hidden-import bem_v11 `
+    --hidden-import bem_v13 `
+    --hidden-import bem_v14 `
+    --hidden-import bem_v15 `
+    --hidden-import efmi_shapes `
+    --distpath (Join-Path $Destination "dist") `
+    --workpath (Join-Path $Destination "work") `
+    --specpath $Destination `
+    (Join-Path $repo "tools\CustomModel\bem_tool.py")
+if ($LASTEXITCODE -ne 0) { throw "BEM converter build failed." }
+$converterDir = Join-Path $Destination 'dist\BetterEndfieldNext.BemConverter'
+$converterExe = Join-Path $converterDir 'BetterEndfieldNext.BemConverter.exe'
+$versionOutput = & $converterExe --version
+if ($LASTEXITCODE -ne 0 -or ($versionOutput -join ' ') -notmatch ('BEM Tools ' + [regex]::Escape($toolVersion))) {
+    throw "Frozen BEM converter version check failed: $($versionOutput -join ' ')"
+}
+$warningFile = Join-Path (Join-Path $Destination 'work\BetterEndfieldNext.BemConverter') 'warn-BetterEndfieldNext.BemConverter.txt'
+if ((Test-Path -LiteralPath $warningFile) -and
+    (Select-String -LiteralPath $warningFile -Pattern 'bem_v15' -SimpleMatch -Quiet)) {
+    throw "Frozen BEM converter cannot import bem_v15. See $warningFile"
+}
+$smokeBem = Join-Path $Destination 'smoke-test.bem'
+& $python -c @"
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import bem_v1
+from test_bem_v1 import fixture
+fixture().write(Path(sys.argv[2]))
+"@ (Join-Path $repo 'tools\CustomModel') $smokeBem
+if ($LASTEXITCODE -ne 0) { throw "BEM smoke package generation failed." }
+try {
+    $validationOutput = & $converterExe validate $smokeBem
+    if ($LASTEXITCODE -ne 0 -or ($validationOutput -join ' ') -notmatch '"success":\s*true') {
+        throw "Frozen BEM converter smoke validation failed: $($validationOutput -join ' ')"
+    }
+} finally {
+    Remove-Item -LiteralPath $smokeBem -Force -ErrorAction SilentlyContinue
+}
+$guiPublishDir = Join-Path $Destination 'gui-publish'
+& $dotnet publish (Join-Path $repo 'ui/BetterEndfieldNext.BemTools/BetterEndfieldNext.BemTools.csproj') `
+    -c Release -r win-x64 --self-contained true -p:Platform=x64 `
+    -p:DebugType=None -p:DebugSymbols=false "-p:PublishDir=$guiPublishDir\\" `
+    "-p:BEWorkspaceBuildRoot=$($ws.paths.build)" `
+    "-p:Version=$toolVersion" "-p:InformationalVersion=$toolVersion"
+if ($LASTEXITCODE -ne 0) { throw "BEM creator GUI build failed." }
+if (-not $SkipSigning) {
+    & (Join-Path $PSScriptRoot 'SignNextRelease.ps1') -Path $guiPublishDir -WorkspaceConfig $WorkspaceConfig
+    & (Join-Path $PSScriptRoot 'SignNextRelease.ps1') -Path (Join-Path $Destination 'dist\BetterEndfieldNext.BemConverter') -WorkspaceConfig $WorkspaceConfig
+}
+$packageArgs = @((Join-Path $repo 'tools\CustomModel\package_toolchain.py'),
+    (Join-Path $Destination 'dist\BetterEndfieldNext.BemConverter'),
+    '--gui-directory', $guiPublishDir,
+    '--archive-backend', $ArchiveBackend,
+    '--composer-directory', $composerDirectory)
+if ($ws.config_file) { $packageArgs += @('--workspace-config', $ws.config_file) }
+& $python @packageArgs
+if ($LASTEXITCODE -ne 0) { throw "BEM toolchain packaging failed." }
+$toolArchive = Join-Path $Destination 'dist\BEM-Tools-win-x64.zip'
+$releaseDir = Get-BEReleaseDirectory -Workspace $ws
+New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+$releaseArchive = Join-Path $releaseDir "BEM-Tools-$toolVersion-win-x64.zip"
+if ([System.IO.Path]::GetFullPath($toolArchive) -ne [System.IO.Path]::GetFullPath($releaseArchive)) {
+    Copy-Item -LiteralPath $toolArchive -Destination $releaseArchive -Force
+}
+Write-Host "BEM toolchain ZIP: $releaseArchive"
+
+# The DeepSeek Harness bundle carries the same skill the ZIP ships, packaged so
+# `dsh plugin add` can install it. It does not depend on the GUI, so it is built
+# beside the ZIP rather than inside it. It does need the Python CLI tree, which
+# is why the release pipeline builds this only in the job that owns that tree.
+if (-not $SkipDshPlugin) {
+    $pluginArgs = @((Join-Path $repo 'scripts\BuildDshPlugin.py'))
+    if ($ws.config_file) { $pluginArgs += @('--workspace-config', $ws.config_file) }
+    & $python @pluginArgs
+    if ($LASTEXITCODE -ne 0) { throw "DSH plugin packaging failed." }
+    Write-Host "DSH plugin bundle: $(Join-Path $releaseDir "dsh-bem-creator-$toolVersion.tgz")"
+}
+
+Write-Host "BEM creator GUI: BEM-Tools/BetterEndfieldNext.BemTools.exe inside the ZIP"
+Write-Host "BEM converter: $Destination\dist\BetterEndfieldNext.BemConverter"

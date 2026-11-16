@@ -1,0 +1,29 @@
+{
+  "name": "better-endfield-combat-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "check": "tsc -b --pretty false",
+    "mods:dev": "vite --config mod-center/vite.config.ts",
+    "mods:build": "node mod-center/scripts/build-supporters.mjs && tsc -p mod-center/tsconfig.json && vite build --config mod-center/vite.config.ts",
+    "mods:check": "tsc -p mod-center/tsconfig.json",
+    "mods:test": "node --test mod-center/server/server.test.mjs",
+    "mods:serve": "node mod-center/server/server.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "nodemailer": "^10.0.15",
+    "preact": "^10.27.2"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.2",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3",
+    "vitest": "^3.2.4"
+  }
+}

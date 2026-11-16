@@ -1,0 +1,1627 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BetterEndfieldNext Combat Data Exporter & Incremental Sync Tool
+==========================================================
+Extracts official Chinese names, identifiers, attributes, and semantic bindings
+from raw dumped game tables and generates a unified, ultra-compact dictionary for
+both the desktop client and web analyzer platform.
+
+Features:
+- Full extraction: Characters, Skills, Talents, Weapons, Suits, Dungeons, Series, Buff Semantics
+- Incremental Diff & Changelog: Detects added/modified/removed items on game updates
+- Multi-target output: Pretty JSON, Minified Web Bundle (.min.json), Diff Report
+- Referenced icon extraction: game VFS -> optimized web PNGs with strict coverage
+- Deterministic hashing & strict verification
+"""
+
+import argparse
+import collections
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from workspace_config import load_workspace, producer_key, write_if_changed
+from RefreshEndfieldResourceInputs import (
+    configured_path, publish_snapshot, read_metadata, snapshot_complete,
+    tool_revision, vfs_block_snapshot,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class GameTableReader:
+    def __init__(self, table_dir: Path):
+        self.table_dir = table_dir
+        self._cache: Dict[str, Any] = {}
+        self._i18n: Dict[str, str] = {}
+        self._load_i18n()
+
+    def _load_i18n(self) -> None:
+        path = self.table_dir / "I18nTextTable_CN.json"
+        if not path.exists():
+            print(f"[!] Warning: {path} not found. Localized names will be empty.")
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            self._i18n = json.load(f)
+        print(f"[*] Loaded {len(self._i18n):,} localized strings from I18nTextTable_CN")
+
+    def get_text(self, id_dict_or_id: Any) -> str:
+        if isinstance(id_dict_or_id, dict):
+            tid = str(id_dict_or_id.get("id", ""))
+        else:
+            tid = str(id_dict_or_id)
+        if not tid or tid == "0":
+            return ""
+        return self._i18n.get(tid, "").strip()
+
+    def load_table(self, filename: str) -> Dict[str, Any]:
+        if filename in self._cache:
+            return self._cache[filename]
+        path = self.table_dir / filename
+        if not path.exists():
+            print(f"[!] Warning: Table {filename} not found.")
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self._cache[filename] = data
+        return data
+
+
+def extract_characters(reader: GameTableReader) -> Dict[str, Any]:
+    chars = reader.load_table("CharacterTable.json")
+    result = {}
+    for cid, c in chars.items():
+        if not isinstance(c, dict):
+            continue
+        name = reader.get_text(c.get("name"))
+        if not name:
+            continue
+        result[cid] = {
+            "name": name,
+            "engName": reader.get_text(c.get("engName")),
+            "rarity": c.get("rarity", 0),
+            "profession": c.get("profession", 0),
+            "weaponType": c.get("weaponType", 0),
+            "charTypeId": c.get("charTypeId", ""),
+            "department": c.get("department", ""),
+            "defaultWeaponId": c.get("defaultWeaponId", ""),
+            "iconAvatar": f"icon_head_{cid}",
+        }
+    return dict(sorted(result.items()))
+
+
+def extract_skills_and_talents(reader: GameTableReader) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    growth = reader.load_table("CharGrowthTable.json")
+    patch = reader.load_table("SkillPatchTable.json")
+    skills = {}
+    talents = {}
+
+    for cid, g in growth.items():
+        if not isinstance(g, dict):
+            continue
+        # 1. Character Skills
+        sg = g.get("skillGroupMap", {})
+        for stype, sinfo in sg.items():
+            if not isinstance(sinfo, dict):
+                continue
+            sname = reader.get_text(sinfo.get("name"))
+            sdesc = reader.get_text(sinfo.get("desc"))
+            if sname:
+                category = "attack"
+                if "comboskill" in stype.lower():
+                    category = "combo"
+                elif "ultimateskill" in stype.lower():
+                    category = "ultimate"
+                elif "normalskill" in stype.lower():
+                    category = "skill"
+                elif "normalattack" in stype.lower():
+                    category = "attack"
+
+                skills[stype] = {
+                    "characterId": cid,
+                    "name": sname,
+                    "category": category,
+                    "desc": sdesc,
+                    "iconId": sinfo.get("icon", ""),
+                    "skillIds": (
+                        sinfo.get("skillIdList", [])
+                        if isinstance(sinfo.get("skillIdList", []), list)
+                        else [sinfo.get("skillIdList")]
+                    ),
+                }
+
+        # 2. Character Talents
+        tn = g.get("talentNodeMap", {})
+        for tid, tinfo in tn.items():
+            if not isinstance(tinfo, dict):
+                continue
+            pnode = tinfo.get("passiveSkillNodeInfo", {})
+            tname = reader.get_text(pnode.get("name"))
+            eff_id = pnode.get("talentEffectId", "")
+            if tname:
+                key = eff_id if eff_id else tid
+                talents[key] = {
+                    "characterId": cid,
+                    "nodeId": tid,
+                    "name": tname,
+                    "iconId": pnode.get("iconId", ""),
+                }
+
+    # 3. Add standalone skill patches (e.g. wpn skills, general skills)
+    for pkey, pval in patch.items():
+        if pkey in skills or not isinstance(pval, dict):
+            continue
+        bundles = pval.get("SkillPatchDataBundle", [])
+        if bundles and isinstance(bundles[0], dict):
+            pname = reader.get_text(bundles[0].get("skillName"))
+            pdesc = reader.get_text(bundles[0].get("skillDesc"))
+            if pname:
+                skills[pkey] = {
+                    "name": pname,
+                    "category": "passive_patch",
+                    "desc": pdesc,
+                }
+
+    return dict(sorted(skills.items())), dict(sorted(talents.items()))
+
+
+def extract_weapons(reader: GameTableReader) -> Dict[str, Any]:
+    items = reader.load_table("ItemTable.json")
+    weapons = reader.load_table("WeaponBasicTable.json")
+    patch = reader.load_table("SkillPatchTable.json")
+    result = {}
+
+    for wid, w in weapons.items():
+        if not isinstance(w, dict):
+            continue
+        item_info = items.get(wid, {})
+        wname = reader.get_text(item_info.get("name"))
+        pskill_id = w.get("weaponPotentialSkill", "")
+        pskill_name = ""
+        if pskill_id in patch:
+            bundles = patch[pskill_id].get("SkillPatchDataBundle", [])
+            if bundles and isinstance(bundles[0], dict):
+                pskill_name = reader.get_text(bundles[0].get("skillName"))
+
+        result[wid] = {
+            "name": wname if wname else wid,
+            "rarity": w.get("rarity", 0),
+            "weaponType": w.get("weaponType", 0),
+            "iconId": item_info.get("iconId", wid),
+            "potentialSkillId": pskill_id,
+            "potentialSkillName": pskill_name,
+        }
+    return dict(sorted(result.items()))
+
+
+def extract_suits(reader: GameTableReader) -> Dict[str, Any]:
+    suits = reader.load_table("EquipSuitTable.json")
+    patch = reader.load_table("SkillPatchTable.json")
+    result = {}
+
+    for sid, s in suits.items():
+        if not isinstance(s, dict):
+            continue
+        slist = s.get("list", [])
+        if not slist or not isinstance(slist[0], dict):
+            continue
+        sitem = slist[0]
+        sname = reader.get_text(sitem.get("suitName"))
+        pskill = sitem.get("skillID", "")
+        pskill_name = ""
+        if pskill in patch:
+            bundles = patch[pskill].get("SkillPatchDataBundle", [])
+            if bundles and isinstance(bundles[0], dict):
+                pskill_name = reader.get_text(bundles[0].get("skillName"))
+
+        result[sid] = {
+            "name": sname if sname else sid,
+            "skillId": pskill,
+            "skillName": pskill_name,
+            "logoName": sitem.get("suitLogoName", ""),
+            "bonuses": [
+                {
+                    "count": item.get("equipCnt", 0),
+                    "skillId": item.get("skillID", ""),
+                    "skillLevel": item.get("skillLv", 0),
+                }
+                for item in slist
+                if isinstance(item, dict)
+            ],
+        }
+    return dict(sorted(result.items()))
+
+
+def extract_equipment(reader: GameTableReader) -> Dict[str, Any]:
+    items = reader.load_table("ItemTable.json")
+    equipment = reader.load_table("EquipTable.json")
+    result = {}
+    for equip_id, equip in equipment.items():
+        if not isinstance(equip, dict):
+            continue
+        item = items.get(equip_id, {})
+        modifiers = []
+        base = equip.get("displayBaseAttrModifier")
+        if isinstance(base, dict):
+            modifiers.append({
+                "index": base.get("attrIndex", 0),
+                "type": base.get("attrType", 0),
+                "value": base.get("attrValue", 0),
+                "modifierType": base.get("modifierType", 0),
+                "base": True,
+            })
+        for modifier in equip.get("displayAttrModifiers", []):
+            if not isinstance(modifier, dict):
+                continue
+            modifiers.append({
+                "index": modifier.get("attrIndex", 0),
+                "type": modifier.get("attrType", 0),
+                "value": modifier.get("attrValue", 0),
+                "modifierType": modifier.get("modifierType", 0),
+                "enhancedValues": modifier.get("enhancedAttrValues", []),
+                "base": False,
+            })
+        result[equip_id] = {
+            "name": reader.get_text(item.get("name")) or equip_id,
+            "rarity": item.get("rarity", 0),
+            "iconId": item.get("iconId", equip_id),
+            "partType": equip.get("partType", 0),
+            "suitId": equip.get("suitID", ""),
+            "minWearLevel": equip.get("minWearLv", 0),
+            "modifiers": modifiers,
+        }
+    return dict(sorted(result.items()))
+
+
+def extract_dungeons_and_series(reader: GameTableReader) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    dungeons = reader.load_table("DungeonTable.json")
+    series = reader.load_table("DungeonSeriesTable.json")
+    cat2nd = reader.load_table("DungeonCategory2ndTable.json")
+
+    series_dict = {}
+    for srid, sr in series.items():
+        if not isinstance(sr, dict):
+            continue
+        sname = reader.get_text(sr.get("name"))
+        if sname:
+            series_dict[srid] = sname
+
+    category_tags = {}
+    for cid, c in cat2nd.items():
+        if isinstance(c, dict):
+            cname = reader.get_text(c.get("name")) or reader.get_text(c.get("categoryName"))
+            if cname:
+                category_tags[str(cid)] = cname
+
+    dung_dict = {}
+    for did, d in dungeons.items():
+        if not isinstance(d, dict):
+            continue
+        dname = reader.get_text(d.get("dungeonName"))
+        subname = reader.get_text(d.get("dungeonSubName"))
+        srid = d.get("dungeonSeriesId", "")
+        dung_dict[did] = {
+            "name": dname if dname else did,
+            "subName": subname,
+            "seriesId": srid,
+            "seriesName": series_dict.get(srid, ""),
+            # The in-game tab a stage lives under, and its order within it.
+            "category": d.get("dungeonCategory", ""),
+            "sortId": d.get("sortId", 0),
+            "domainId": d.get("domainId", ""),
+            "costStamina": d.get("costStamina", 0),
+        }
+
+    return dict(sorted(dung_dict.items())), dict(sorted(series_dict.items()))
+
+
+def extract_buff_semantics(besem_path: Optional[Path]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    exact_sources: Dict[str, Set[Tuple[str, str, str]]] = {}
+    if besem_path and besem_path.exists():
+        with open(besem_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if not parts:
+                    continue
+                if parts[0] == "E" and len(parts) >= 5:
+                    buff_id = parts[1]
+                    status = parts[2]
+                    zone = parts[3]
+                    element = parts[4]
+                    rate = parts[6] if len(parts) > 6 else ""
+                    source_kind = parts[8] if len(parts) > 8 else ""
+                    source_id = parts[9] if len(parts) > 9 else ""
+                    skill_id = parts[10] if len(parts) > 10 else ""
+                    confidence = parts[11] if len(parts) > 11 else ""
+                    result[buff_id] = {
+                        "status": status,
+                        "zone": zone,
+                        "element": element,
+                        "rate": rate,
+                    }
+                    if (source_kind and source_id and
+                            (status in {"verified", "verified_alias"} or
+                             confidence == "compiled_from_unpack")):
+                        exact_sources.setdefault(buff_id, set()).add(
+                            (source_kind, source_id, skill_id)
+                        )
+                elif parts[0] == "B" and len(parts) >= 3:
+                    num_id = parts[1]
+                    buff_id = parts[2]
+                    if buff_id not in result:
+                        result[buff_id] = {
+                            "numericId": int(num_id) if num_id.isdigit() else 0,
+                            "status": "numeric_mapped",
+                            "zone": "other",
+                            "element": "all",
+                        }
+                    else:
+                        result[buff_id]["numericId"] = int(num_id) if num_id.isdigit() else 0
+
+    for buff_id, entry in result.items():
+        sources = exact_sources.get(buff_id, set())
+        source_pairs = {(kind, source_id) for kind, source_id, _ in sources}
+        if len(source_pairs) == 1:
+            kind, source_id = next(iter(source_pairs))
+            skills = {skill for _, _, skill in sources if skill}
+            entry["sourceKind"] = kind
+            entry["sourceId"] = source_id
+            entry["skillId"] = next(iter(skills)) if len(skills) == 1 else ""
+            entry["sourceAttribution"] = "dictionaryExact"
+            if len(skills) > 1:
+                entry["attributionReason"] = "conflicting_source_skill_ids"
+        else:
+            entry["sourceKind"] = ""
+            entry["sourceId"] = ""
+            entry["skillId"] = ""
+            entry["sourceAttribution"] = "unknown"
+            entry["attributionReason"] = (
+                "conflicting_source_templates" if len(source_pairs) > 1
+                else "no_exact_source_mapping"
+            )
+
+    # Poise Break default semantics
+    poise_buffs = {
+        "buff_common_poise_break_damage_taken_scale": {
+            "status": "verified", "zone": "vuln_taken", "element": "all", "desc": "破韧失衡易伤增幅"
+        },
+        "buff_common_poise_can_be_breaking_attacked": {
+            "status": "verified", "zone": "vuln_taken", "element": "all", "desc": "失衡可处决重击状态"
+        },
+        "buff_common_mini_poise_break": {
+            "status": "verified", "zone": "vuln_taken", "element": "all", "desc": "微失衡/破韧节点"
+        },
+        "buff_common_temp_poise_break": {
+            "status": "verified", "zone": "vuln_taken", "element": "all", "desc": "瞬时失衡"
+        },
+    }
+    for p_id, p_info in poise_buffs.items():
+        if p_id in result:
+            result[p_id].update(p_info)
+        else:
+            result[p_id] = p_info
+
+    return dict(sorted(result.items()))
+
+
+def build_buff_source_index(
+    reader: GameTableReader,
+    json_data_dir: Path,
+    schema_path: Path,
+) -> Tuple[Dict[str, Set[Tuple[str, str, str, str]]], Dict[str, Any], Dict[str, Set[str]]]:
+    """Build exact Buff ownership candidates from authoritative references."""
+    skill_dir = json_data_dir / "SkillData"
+    buff_dir = json_data_dir / "BuffData"
+    if not skill_dir.is_dir() or not buff_dir.is_dir():
+        raise FileNotFoundError(
+            "JsonData SkillData/BuffData cache is incomplete: " +
+            str(json_data_dir.resolve())
+        )
+
+    skill_files = {path.stem.lower(): path for path in skill_dir.glob("*.json")}
+    buff_files = {path.stem.lower(): path for path in buff_dir.glob("*.json")}
+    known_ids = set(skill_files) | set(buff_files)
+    graph: Dict[str, Set[str]] = {}
+    source_hash = hashlib.sha256()
+    from memorypack_refs import ReferenceReader
+    reference_reader = ReferenceReader(schema_path, json_data_dir / "StringPool")
+    # Pool indices can remain unchanged while their strings change. Include
+    # the schema and pool inputs in the existing source fingerprint.
+    source_hash.update(schema_path.read_bytes())
+    for path in sorted((json_data_dir / "StringPool").glob("StringPool*.byte")):
+        source_hash.update(path.name.encode("utf-8"))
+        source_hash.update(hashlib.sha256(path.read_bytes()).digest())
+    for config_id, path in sorted(
+        [*skill_files.items(), *buff_files.items()], key=lambda item: item[0]
+    ):
+        payload = path.read_bytes()
+        source_hash.update(config_id.encode("utf-8"))
+        source_hash.update(hashlib.sha256(payload).digest())
+        tokens = reference_reader.read(path)
+        graph[config_id] = tokens & known_ids
+
+    # kind, template id, source/display skill id, traversal root
+    roots: Set[Tuple[str, str, str, str]] = set()
+    growth = reader.load_table("CharGrowthTable.json")
+    talent_owner: Dict[str, str] = {}
+    for char_id, value in growth.items():
+        if not isinstance(value, dict):
+            continue
+        for skill_group in value.get("skillGroupMap", {}).values():
+            if not isinstance(skill_group, dict):
+                continue
+            skill_ids = skill_group.get("skillIdList", [])
+            if not isinstance(skill_ids, list):
+                skill_ids = [skill_ids]
+            for skill_id in skill_ids:
+                if skill_id:
+                    root = str(skill_id).lower()
+                    roots.add(("characterSkill", char_id, root, root))
+        for node in value.get("talentNodeMap", {}).values():
+            if not isinstance(node, dict):
+                continue
+            effect_id = node.get("passiveSkillNodeInfo", {}).get(
+                "talentEffectId", ""
+            )
+            if effect_id:
+                talent_owner[str(effect_id).lower()] = char_id
+
+    potential_owner: Dict[str, str] = {}
+    for char_id, value in reader.load_table("CharacterPotentialTable.json").items():
+        if not isinstance(value, dict):
+            continue
+        for unlock in value.get("potentialUnlockBundle", []):
+            if isinstance(unlock, dict) and unlock.get("potentialEffectId"):
+                potential_owner[str(unlock["potentialEffectId"]).lower()] = char_id
+
+    # Talents and potentials are table-driven. Only direct attachment links are
+    # evidence. Blackboard changes to an active skill are not classified as a
+    # passive source because that would be an inference rather than ownership.
+    passive_effects = reader.load_table("PotentialTalentEffectTable.json")
+    for effect_id, value in passive_effects.items():
+        effect_key = str(effect_id).lower()
+        char_id = talent_owner.get(effect_key) or potential_owner.get(effect_key)
+        if not char_id or not isinstance(value, dict):
+            continue
+        for effect in value.get("dataList", []):
+            if not isinstance(effect, dict):
+                continue
+            buff_id = str(effect.get("attachBuff", {}).get("buffId", "")).lower()
+            skill_id = str(effect.get("attachSkill", {}).get("skillId", "")).lower()
+            if buff_id:
+                roots.add(("characterPassive", char_id, effect_key, buff_id))
+            if skill_id:
+                roots.add(("characterPassive", char_id, effect_key, skill_id))
+
+    for weapon_id, value in reader.load_table("WeaponBasicTable.json").items():
+        if not isinstance(value, dict):
+            continue
+        skill_ids: List[Any] = []
+        for key in ("weaponPotentialSkill", "weaponSkillList"):
+            item = value.get(key, [])
+            skill_ids.extend(item if isinstance(item, list) else [item])
+        for skill_id in skill_ids:
+            if skill_id:
+                root = str(skill_id).lower()
+                roots.add(("weapon", weapon_id, root, root))
+
+    for suit_id, value in reader.load_table("EquipSuitTable.json").items():
+        if not isinstance(value, dict):
+            continue
+        for bonus in value.get("list", []):
+            if not isinstance(bonus, dict) or not bonus.get("skillID"):
+                continue
+            root = str(bonus["skillID"]).lower()
+            roots.add(("equipSuit", suit_id, root, root))
+
+    # Direct SkillData -> BuffData references. At runtime the recorder knows
+    # which origin skill created a Buff; the static config confirming that the
+    # skill's own definition references the Buff makes the pair exact evidence
+    # without any ownership-candidate table.
+    skill_buff_edges: Dict[str, Set[str]] = {}
+    for skill_id in skill_files:
+        edges = {item for item in graph.get(skill_id, set()) if item in buff_files}
+        if edges:
+            skill_buff_edges[skill_id] = edges
+
+    result: Dict[str, Set[Tuple[str, str, str, str]]] = collections.defaultdict(set)
+    missing_roots: Set[str] = set()
+    for kind, template_id, source_skill_id, root in sorted(roots):
+        if root not in graph:
+            missing_roots.add(root)
+            continue
+        # A SkillData string naming another SkillData can be a comparison, UI
+        # reference, or orchestration link, so it is not safe evidence that all
+        # of the other skill's Buffs share ownership. Start only from BuffData
+        # directly referenced by the authoritative root, then follow Buff-to-
+        # Buff links. A direct passive attachBuff is itself an accepted root.
+        initial_buffs = ({root} if root in buff_files else {
+            item for item in graph[root] if item in buff_files
+        })
+        queue = list(initial_buffs)
+        visited = set(initial_buffs)
+        for node in queue:
+            for referenced in graph.get(node, set()):
+                if referenced in buff_files and referenced not in visited:
+                    visited.add(referenced)
+                    queue.append(referenced)
+        trigger_skill_id = root if root in skill_files else ""
+        for node in visited:
+            if node in buff_files:
+                result[node].add(
+                    (kind, template_id, source_skill_id, trigger_skill_id)
+                )
+
+    stats = {
+        "schemaVersion": 2,
+        "referenceEncoding": "memorypack-pooled-1.6.3",
+        "sourceSha256": source_hash.hexdigest(),
+        "skillConfigs": len(skill_files),
+        "buffConfigs": len(buff_files),
+        "referenceEdges": sum(len(items) for items in graph.values()),
+        "sourceRoots": len(roots),
+        "missingRoots": len(missing_roots),
+        "mappedBuffs": len(result),
+        "candidateRows": sum(len(items) for items in result.values()),
+        "ambiguousBuffs": sum(len(items) > 1 for items in result.values()),
+        "skillBuffEdges": sum(len(items) for items in skill_buff_edges.values()),
+    }
+    return dict(sorted(result.items())), stats, dict(sorted(skill_buff_edges.items()))
+
+
+def write_buff_source_map(
+    output: Path,
+    sources: Dict[str, Set[Tuple[str, str, str, str]]],
+    stats: Dict[str, Any],
+    skill_buff_edges: Dict[str, Set[str]],
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    handle = io.StringIO()
+    handle.write("BESOURCE\t2\n")
+    handle.write(f"M\tsourceSha256\t{stats['sourceSha256']}\n")
+    for key in ("skillConfigs", "buffConfigs", "referenceEdges",
+                "sourceRoots", "missingRoots", "mappedBuffs",
+                "candidateRows", "ambiguousBuffs", "skillBuffEdges"):
+        handle.write(f"M\t{key}\t{stats[key]}\n")
+    for buff_id, candidates in sources.items():
+        for kind, template_id, source_skill_id, trigger_skill_id in sorted(candidates):
+            handle.write(
+                "C\t" + "\t".join((buff_id, kind, template_id,
+                                       source_skill_id, trigger_skill_id)) + "\n"
+            )
+    for skill_id, buff_ids in skill_buff_edges.items():
+        for buff_id in sorted(buff_ids):
+            handle.write(f"S\t{skill_id}\t{buff_id}\n")
+    write_if_changed(output, handle.getvalue())
+
+
+def compute_incremental_diff(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    diff: Dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "summary": {},
+        "categories": {},
+    }
+    categories = ["characters", "skills", "talents", "weapons", "equipment", "suits", "dungeons", "dungeonSeries", "buffs"]
+    total_added = 0
+    total_modified = 0
+    total_removed = 0
+
+    for cat in categories:
+        prev_cat = previous.get(cat, {})
+        curr_cat = current.get(cat, {})
+        prev_keys = set(prev_cat.keys())
+        curr_keys = set(curr_cat.keys())
+
+        added_keys = sorted(curr_keys - prev_keys)
+        removed_keys = sorted(prev_keys - curr_keys)
+        modified_keys = []
+
+        for key in curr_keys & prev_keys:
+            if curr_cat[key] != prev_cat[key]:
+                modified_keys.append(key)
+        modified_keys.sort()
+
+        diff["categories"][cat] = {
+            "addedCount": len(added_keys),
+            "modifiedCount": len(modified_keys),
+            "removedCount": len(removed_keys),
+            "added": [k for k in added_keys[:50]],
+            "modified": [k for k in modified_keys[:50]],
+            "removed": removed_keys,
+        }
+        total_added += len(added_keys)
+        total_modified += len(modified_keys)
+        total_removed += len(removed_keys)
+
+    diff["summary"] = {
+        "totalAdded": total_added,
+        "totalModified": total_modified,
+        "totalRemoved": total_removed,
+        "hasChanges": (total_added + total_modified + total_removed) > 0,
+    }
+    return diff
+
+
+def create_minified_web_dict(full_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the compact records required by the schema-8 web analyzer."""
+    min_chars = {
+        k: {
+            "n": v.get("name", k), "r": v.get("rarity", 0),
+            "p": v.get("profession", 0), "wt": v.get("weaponType", 0),
+            "i": f"icons/characters/{k}.png",
+        }
+        for k, v in full_dict.get("characters", {}).items()
+    }
+    min_skills = {
+        k: {
+            "n": v.get("name", k), "c": v.get("category", "other"),
+            "i": v.get("iconId", ""), "ids": v.get("skillIds", []),
+            "ch": v.get("characterId", ""),
+        }
+        for k, v in full_dict.get("skills", {}).items()
+    }
+    min_talents = {k: v["name"] for k, v in full_dict.get("talents", {}).items() if "name" in v}
+    min_weapons = {
+        k: {
+            "n": v.get("name", k), "r": v.get("rarity", 0),
+            "t": v.get("weaponType", 0), "i": v.get("iconId", k),
+            "sid": v.get("potentialSkillId", ""),
+            "sn": v.get("potentialSkillName", ""),
+        }
+        for k, v in full_dict.get("weapons", {}).items()
+    }
+    min_equipment = {
+        k: {
+            "n": v.get("name", k), "r": v.get("rarity", 0),
+            "i": v.get("iconId", k), "p": v.get("partType", 0),
+            "su": v.get("suitId", ""), "lv": v.get("minWearLevel", 0),
+            "m": v.get("modifiers", []),
+        }
+        for k, v in full_dict.get("equipment", {}).items()
+    }
+    min_suits = {
+        k: {
+            "n": v.get("name", k), "i": v.get("logoName", ""),
+            "sid": v.get("skillId", ""), "sn": v.get("skillName", ""),
+            "b": v.get("bonuses", []),
+        }
+        for k, v in full_dict.get("suits", {}).items()
+    }
+    min_dungeons = {
+        k: {
+            "n": v.get("name", k), "sn": v.get("subName", ""),
+            "s": v.get("seriesId", ""), "m": v.get("modeId", ""),
+        }
+        for k, v in full_dict.get("dungeons", {}).items()
+    }
+    min_series = full_dict.get("dungeonSeries", {})
+
+    return {
+        "schemaVersion": full_dict.get("metadata", {}).get("schemaVersion", 1),
+        "exportedAt": full_dict.get("metadata", {}).get("exportedAt", ""),
+        "c": min_chars,
+        "sk": min_skills,
+        "t": min_talents,
+        "w": min_weapons,
+        "eq": min_equipment,
+        "su": min_suits,
+        "d": min_dungeons,
+        "ds": min_series,
+        # rDPS contribution categories; keep in sync with RdpsContributionKind
+        # (native/modules/combat_stats/module.cpp) and web CONTRIBUTION_CATEGORIES.
+        "zones": [
+            "直伤", "攻击力", "增伤", "异常增伤", "增幅", "暴击", "独立乘区",
+            "脆弱", "承伤", "减防", "减抗", "法术强度", "其他"
+        ],
+    }
+
+
+def load_id_registry(path: Path) -> Tuple[List[str], Dict[str, int]]:
+    """Permanent numeric ids for every string a snapshot may reference.
+
+    BEC snapshots store indices, not strings, so an index must never change
+    meaning: the registry is append-only and survives across exports. Index 0 is
+    the empty id, which is what an unresolved reference decodes back to.
+    """
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        ids = payload.get("ids") or [""]
+    else:
+        ids = [""]
+    if not ids or ids[0] != "":
+        ids = [""] + [value for value in ids if value != ""]
+    return ids, {value: index for index, value in enumerate(ids)}
+
+
+def register_ids(ids: List[str], lookup: Dict[str, int], values: Iterable[str]) -> int:
+    added = 0
+    for value in values:
+        if not value or value in lookup:
+            continue
+        lookup[value] = len(ids)
+        ids.append(value)
+        added += 1
+    return added
+
+
+def collect_registry_ids(full_dict: Dict[str, Any], buff_ids: Iterable[str]) -> List[str]:
+    """Every id a record can name, in a stable order for first-time assignment."""
+    out: List[str] = []
+    for section in ("characters", "skills", "talents", "weapons", "equipment", "suits", "dungeons"):
+        out.extend(sorted(full_dict.get(section, {}).keys()))
+    # Skills are recorded by their runtime ids, which the table lists as aliases.
+    for key, value in sorted(full_dict.get("skills", {}).items()):
+        out.extend(value.get("skillIds") or [])
+    out.extend(sorted(full_dict.get("dungeonSeries", {}).keys()))
+    out.extend(sorted(buff_ids))
+    return out
+
+
+def discover_buff_ids(buff_data_dir: Optional[Path]) -> List[str]:
+    """Buff ids come from the BuffData filenames; the contents are MemoryPack."""
+    if not buff_data_dir or not buff_data_dir.is_dir():
+        return []
+    return sorted(path.stem for path in buff_data_dir.glob("*.json"))
+
+
+# The leaderboard navigates by the in-game tab (DungeonTable.dungeonCategory).
+# DungeonTypeTable has no display name for it — enemyInfoTitle is the closest
+# thing and it collapses seven distinct tabs onto "协议空间" — so the labels and
+# their order are curated here. Categories missing from this list still appear,
+# after the listed ones, under their own id.
+STAGE_CATEGORIES = [
+    ("dungeon_seasontower", "战争回响"),
+    ("dungeon_highdifficulty", "影拓丰碑"),
+    ("dungeon_bossrush", "危境再现"),
+    ("dungeon_weeklyraid", "周常突袭"),
+    ("dungeon_takestwo", "竞技大会"),
+    ("dungeon_ss", "协议空间·高阶培养"),
+    ("dungeon_worldlevel", "协议空间·探索等级"),
+    ("dungeon_resource", "协议空间·资源采集"),
+    ("dungeon_actmonster", "生存特训"),
+    ("dungeon_challenge", "秘境探索"),
+    ("dungeon_archery", "提丰靶场"),
+    ("dungeon_race", "根脉奇境"),
+    ("dungeon_wuling_racing", "武陵赛道"),
+    ("dungeon_wuling_A", "武陵城"),
+    ("dungeon_wuling_B", "武陵城·破阵"),
+    ("dungeon_contract", "危机合约"),
+    ("dungeon_chartrial", "作战演练"),
+    ("dungeon_chartutorial", "干员教学"),
+    ("dungeon_train", "战术训练"),
+    ("dungeon_char", "干员支线"),
+    ("dungeon_story", "剧情作战"),
+    ("dungeon_factory", "工业设施"),
+]
+
+# Difficulty variants share a base id and differ only by suffix. The ranks are
+# ordinal, not absolute: they only have to order the members of one family.
+# `_s` is the raid half of every DungeonRaidTable pair and `_hard` the raid half
+# of every DungeonNormal2RaidTable pair, so both sit above the plain id; `_ex`
+# (战争回响·残酷) sits above `_s` (困难); `_guide` is the tutorial run.
+STAGE_DIFFICULTY_SUFFIXES = [("_guide", -1), ("_ex", 3), ("_hard", 2), ("_s", 2)]
+# Boss rush spells its difficulties as a trailing two-digit index on an id that
+# already ends in a digit (dung01_bossrush01_04), which no other family does.
+STAGE_DIFFICULTY_INDEX = re.compile(r"^(.*\d)_(\d{2})$")
+
+
+def split_stage_difficulty(stage_id: str) -> Tuple[str, int]:
+    """Stage id -> (family id, difficulty rank within the family)."""
+    for suffix, rank in STAGE_DIFFICULTY_SUFFIXES:
+        if stage_id.endswith(suffix):
+            return stage_id[: -len(suffix)], rank
+    match = STAGE_DIFFICULTY_INDEX.match(stage_id)
+    if match:
+        return match.group(1), int(match.group(2))
+    return stage_id, 0
+
+
+def build_stage_table(full_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage list for the leaderboard, keyed by the in-game category.
+
+    Each category lists only the hardest difficulty of every stage: a board is
+    per dungeon id, and ranking 普通 next to 残酷 would just bury the runs
+    people care about. Every difficulty stays in `stages` so an already-uploaded
+    record still resolves to a name.
+    """
+    dungeons: Dict[str, Any] = full_dict.get("dungeons", {})
+    series_names = dict(full_dict.get("dungeonSeries", {}))
+    category_names = dict(STAGE_CATEGORIES)
+    category_order = {category: index for index, (category, _) in enumerate(STAGE_CATEGORIES)}
+
+    stages: Dict[str, Any] = {}
+    families: Dict[str, List[Tuple[int, str]]] = {}
+    for stage_id, value in sorted(dungeons.items()):
+        family, rank = split_stage_difficulty(stage_id)
+        category = value.get("category") or "dungeon_other"
+        stages[stage_id] = {
+            "n": value.get("name", stage_id),
+            "sn": value.get("subName", ""),
+            "g": value.get("seriesId", ""),
+            "c": category,
+            "d": rank,
+        }
+        families.setdefault(family, []).append((rank, stage_id))
+
+    members: Dict[str, List[str]] = {}
+    for candidates in families.values():
+        top = max(candidates)[1]
+        members.setdefault(stages[top]["c"], []).append(top)
+
+    def stage_order(stage_id: str) -> Tuple[int, str]:
+        return int(dungeons.get(stage_id, {}).get("sortId", 0) or 0), stage_id
+
+    categories = [
+        {
+            "id": category,
+            "n": category_names.get(category, category),
+            "s": sorted(stage_ids, key=stage_order),
+        }
+        for category, stage_ids in sorted(
+            members.items(),
+            key=lambda item: (category_order.get(item[0], len(category_order)), -len(item[1]), item[0]),
+        )
+    ]
+    used_series = {value["g"] for value in stages.values() if value["g"]}
+    return {
+        "version": 2,
+        "cats": categories,
+        "series": {key: series_names[key] for key in sorted(used_series & set(series_names))},
+        "stages": stages,
+    }
+
+
+def export_web_icons(
+    full_dict: Dict[str, Any],
+    icon_source: Optional[Path],
+    avatar_source: Path,
+    output_dir: Path,
+    refresh_existing: bool = False,
+) -> Dict[str, Any]:
+    """Copy only dictionary-referenced PNGs into the static web bundle.
+
+    The icon source is the PNG tree produced for CombatDataExporter. Files may
+    retain their game folders or be flattened; matching is done by icon stem.
+    """
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError("Pillow is required for web icon conversion: pip install Pillow") from error
+
+    def write_web_png(source: Path, destination: Path, max_edge: int) -> None:
+        if destination.is_file() and not refresh_existing:
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(source) as original:
+            image = original.convert("RGBA")
+            image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            encoded = io.BytesIO()
+        image.save(encoded, format="PNG", optimize=True, compress_level=9)
+        write_if_changed(destination, encoded.getvalue())
+
+    groups: Dict[str, Set[str]] = {
+        "skills": {
+            str(item.get("iconId", ""))
+            for item in full_dict.get("skills", {}).values()
+            if item.get("iconId")
+        },
+        "items": {
+            str(item.get("iconId", ""))
+            for category in ("weapons", "equipment")
+            for item in full_dict.get(category, {}).values()
+            if item.get("iconId")
+        },
+        "suits": {
+            str(item.get("logoName", ""))
+            for item in full_dict.get("suits", {}).values()
+            if item.get("logoName")
+        },
+    }
+    index: Dict[str, Path] = {}
+    if icon_source and icon_source.exists():
+        for path in icon_source.rglob("*.png"):
+            index.setdefault(path.stem.lower(), path)
+
+    copied: Dict[str, List[str]] = {name: [] for name in (*groups.keys(), "characters")}
+    missing: Dict[str, List[str]] = {name: [] for name in groups}
+    for group, icon_ids in groups.items():
+        destination = output_dir / group
+        destination.mkdir(parents=True, exist_ok=True)
+        expected_names = {f"{icon_id}.png".lower() for icon_id in icon_ids}
+        for stale in destination.glob("*.png"):
+            if stale.name.lower() not in expected_names:
+                stale.unlink()
+        for icon_id in sorted(icon_ids):
+            source = index.get(Path(icon_id).stem.lower())
+            if source:
+                write_web_png(source, destination / f"{icon_id}.png", 128)
+                copied[group].append(icon_id)
+            elif (destination / f"{icon_id}.png").is_file():
+                copied[group].append(icon_id)
+            else:
+                missing[group].append(icon_id)
+
+    char_destination = output_dir / "characters"
+    char_destination.mkdir(parents=True, exist_ok=True)
+    expected_char_names = {
+        f"{char_id}.png".lower() for char_id in full_dict.get("characters", {})
+    }
+    for stale in char_destination.glob("*.png"):
+        if stale.name.lower() not in expected_char_names:
+            stale.unlink()
+    for char_id in sorted(full_dict.get("characters", {})):
+        source = avatar_source / f"{char_id}.png"
+        if source.exists():
+            write_web_png(source, char_destination / source.name, 128)
+            copied["characters"].append(char_id)
+
+    manifest = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "source": str(icon_source.resolve()) if icon_source and icon_source.exists() else "",
+        "copied": {key: len(value) for key, value in copied.items()},
+        "missing": missing,
+    }
+    previous_icons = read_metadata(output_dir / "icon-manifest.json")
+    if {k: v for k, v in previous_icons.items() if k != "generatedAt"} == {k: v for k, v in manifest.items() if k != "generatedAt"}:
+        manifest["generatedAt"] = previous_icons.get("generatedAt", manifest["generatedAt"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_if_changed(output_dir / "icon-manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    print("[+] Web icons: " + ", ".join(f"{key}={len(value)}" for key, value in copied.items()))
+    missing_count = sum(len(value) for value in missing.values())
+    if missing_count:
+        print(f"[!] {missing_count} referenced icons are not present in --icon-source")
+    return manifest
+
+
+def default_game_path(ws=None) -> Optional[Path]:
+    ws = ws or load_workspace()
+    return ws.path("game.install_dir", required=False)
+
+
+def default_vfs_path(ws=None) -> Optional[Path]:
+    if os.environ.get("ENDFIELD_VFS"):
+        return Path(os.environ["ENDFIELD_VFS"])
+    game = default_game_path(ws)
+    return game / "Endfield_Data/StreamingAssets" if game else None
+
+
+def refresh_block(game_path: Path, extractor_path: Path, output: Path,
+                  threads: int, block: str, ws=None) -> Dict[str, Any]:
+    ws = ws or load_workspace()
+    if not extractor_path.is_file():
+        raise FileNotFoundError(f"Game {block} extractor missing: {extractor_path}; configure tools.endfield_dump or pass --table-extractor (prebuilt CLI required)")
+    env = ws.env()
+    base_root = game_path / "Endfield_Data/StreamingAssets"
+    persistent_root = game_path / "Endfield_Data/Persistent"
+    indexes = vfs_block_snapshot(game_path, block)
+    revision = tool_revision([extractor_path, Path(__file__)])
+    parameters = {"block": block, "threads": max(1, threads),
+                  "gamePath": str(game_path.resolve()),
+                  "gameVersion": ws.get("game.version"), "resourceSnapshot": ws.get("game.snapshot"),
+                  "toolVersion": ws.get("resource_update.tool_revision", "unknown")}
+    key = producer_key(indexes, revision, parameters)
+    metadata_path = output.parent / "source-metadata.json"
+    previous = read_metadata(metadata_path)
+    if snapshot_complete(output, previous, key):
+        print(f"[*] Reusing complete {block} snapshot: {output}")
+        return previous
+    with tempfile.TemporaryDirectory(prefix="combat-refresh-", dir=ws.path("paths.temp")) as temporary:
+        staging = Path(temporary)
+        extraction_root = staging / "extracted"
+        command = [str(extractor_path), "dump", "--vfs", str(base_root),
+                   "--out", str(extraction_root), "--block", block,
+                   "--threads", str(max(1, threads))]
+        source_kind = "base"
+        if (persistent_root / "VFS").is_dir():
+            command[2:4] = ["--vfs", str(persistent_root)]
+            command[4:4] = ["--base-vfs", str(base_root)]
+            source_kind = "persistent+base"
+        subprocess.run(command, check=True, env=env)
+        staged = extraction_root / ("Table" if block == "Table" else "Data/Json")
+        required = (["CharacterTable.json", "CharGrowthTable.json", "I18nTextTable_CN.json",
+                     "ItemTable.json", "WeaponBasicTable.json", "EquipTable.json",
+                     "EquipSuitTable.json", "DungeonTable.json"] if block == "Table"
+                    else ["SkillData", "BuffData"])
+        if not all((staged / name).is_file() if block == "Table" else (staged / name).is_dir()
+                   for name in required):
+            raise RuntimeError(f"Refreshed {block} block is incomplete")
+        files = sorted(path for path in staged.rglob("*") if path.is_file())
+        if not files or (block != "Table" and not all(any((staged / name).glob("*.json")) for name in required)):
+            raise RuntimeError(f"Refreshed {block} block is empty")
+        # Read/validate the produced JSON before publishing anything.
+        for path in files:
+            if path.suffix.lower() == ".json" and block == "Table":
+                json.loads(path.read_text(encoding="utf-8-sig"))
+        source = {**previous, "kind": source_kind,
+                  "gameVersion": ws.get("game.version"), "resourceSnapshot": ws.get("game.snapshot"),
+                  "refreshedAt": datetime.now(timezone.utc).isoformat(),
+                  "gamePath": str(game_path.resolve()), "baseVfs": str(base_root.resolve()),
+                  "persistentVfs": str(persistent_root.resolve()) if (persistent_root / "VFS").is_dir() else "",
+                  "producerKey": key, "toolRevision": revision, "vfsIndexes": indexes,
+                  "parameters": parameters,
+                  "files": [{"path": path.relative_to(staged).as_posix(), "size": path.stat().st_size,
+                             "sha256": sha256_file(path)} for path in files]}
+        if block == "Table":
+            hashes = {item["path"]: item["sha256"] for item in source["files"]}
+            source.update(tableCount=len(files), requiredSha256={name: hashes[name] for name in required})
+        if {k: v for k, v in previous.items() if k != "refreshedAt"} == {k: v for k, v in source.items() if k != "refreshedAt"}:
+            source["refreshedAt"] = previous.get("refreshedAt", source["refreshedAt"])
+        # Publish the tree and its persistent source metadata together. Only
+        # previously tracked generated files may be removed; manual files stay.
+        publication = staging / "publish"
+        publication.mkdir()
+        os.replace(staged, publication / output.name)
+        write_if_changed(publication / metadata_path.name, json.dumps(source, ensure_ascii=False, indent=2))
+        obsolete = [str(Path(output.name) / item["path"]) for item in previous.get("files", [])]
+        publish_snapshot(publication, output.parent, ws.path("paths.temp"), obsolete)
+        return source
+
+
+def refresh_game_tables(game_path: Path, extractor_path: Path, table_dir: Path,
+                        threads: int, ws=None) -> Dict[str, Any]:
+    return refresh_block(game_path, extractor_path, table_dir, threads, "Table", ws)
+
+
+def refresh_game_json_data(game_path: Path, extractor_path: Path, json_data_dir: Path,
+                          threads: int, ws=None) -> Dict[str, Any]:
+    return refresh_block(game_path, extractor_path, json_data_dir, threads, "JsonData", ws)
+
+
+def load_table_source_metadata(table_dir: Path) -> Dict[str, Any]:
+    path = table_dir.parent / "source-metadata.json"
+    if not path.is_file():
+        return {"kind": "offline-snapshot", "tablePath": str(table_dir.resolve())}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {"kind": "unknown", "tablePath": str(table_dir.resolve())}
+
+
+def extract_named_icons(names: Set[str], vfs_path: Path, base_vfs_path: Optional[Path],
+                        extractor_path: Path, cache_dir: Path, threads: int, ws=None) -> Path:
+    ws = ws or load_workspace()
+    if not extractor_path.is_file():
+        raise FileNotFoundError(f"Image extractor missing: {extractor_path}; configure tools.endfield_dump or pass --image-extractor (prebuilt CLI required)")
+    env = ws.env()
+    if not names:
+        return cache_dir
+    # Inputs are BLC identities; game CHKs are never hashed for cache lookup.
+    identities = []
+    for root in [base_vfs_path, vfs_path]:
+        if root is None:
+            continue
+        vfs = root / "VFS" if (root / "VFS").is_dir() else root
+        if not vfs.is_dir():
+            raise FileNotFoundError(f"Game VFS not found: {vfs}")
+        for directory in sorted(vfs.iterdir()):
+            index = directory / f"{directory.name}.blc"
+            if directory.is_dir() and index.is_file():
+                identities.append({"root": str(vfs.resolve()), "block": directory.name,
+                                   "sha256": sha256_file(index)})
+    if not identities:
+        raise FileNotFoundError("No VFS indexes available for icon cache identity")
+    key = producer_key(identities, tool_revision([extractor_path, Path(__file__)]),
+                       {"names": sorted(names), "threads": max(1, threads), "format": "png",
+                        "toolVersion": ws.get("resource_update.tool_revision", "unknown")})
+    selection = producer_key(sorted(names), "icon-selection-v1", {"threads": max(1, threads)})
+    metadata_path = cache_dir / ".producers" / f"{selection}.json"
+    previous = read_metadata(metadata_path)
+    sizes = {item["path"]: item["size"] for item in previous.get("files", [])}
+    requested = {name for name in names if not (cache_dir / f"{name}.png").is_file()
+                 or (cache_dir / f"{name}.png").stat().st_size != sizes.get(f"{name}.png")}
+    if previous.get("producerKey") != key:
+        requested = set(names)
+    if not requested:
+        return cache_dir
+    pattern = "^(?:" + "|".join(sorted(re.escape(name) for name in requested)) + ")$"
+    bundle_names: Set[str] = set()
+    manifest_path = ws.path("resource_update.input_root", "Bundles", ws.get("game.platform", "Windows"), "manifest.json")
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        bundles = {item["bundleIndex"]: item["name"] for item in manifest["Bundles"]}
+        candidates: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+        for asset in manifest["Assets"]:
+            path = asset["path"].lower()
+            name = Path(path).stem
+            if name in requested and "/ui/sprites/" in path and path.endswith((".png", ".tga")):
+                candidates[name].append(asset)
+        for name in requested:
+            if not candidates[name]:
+                raise ValueError(f"Current manifest has no UI texture for {name}; refusing an unrestricted bundle scan")
+            asset = min(candidates[name], key=lambda item: (
+                "/itemicon/" not in item["path"].lower(), len(item["path"]), item["path"]))
+            bundle_names.add(bundles[asset["bundleIndex"]])
+    with tempfile.TemporaryDirectory(prefix="combat-icons-", dir=ws.path("paths.temp")) as temporary:
+        staging = Path(temporary)
+        command = [str(extractor_path), "extract", "--vfs", str(vfs_path),
+                   "--out", str(staging), "--asset-name", pattern, "--types", "Texture2D",
+                   "--threads", str(max(1, threads)), "--format", "png", "--png-compression", "fast",
+                   "--max-memory-gb", "16", "--exclude-material", "--skip-missing",
+                   "--scratch", str(staging / "bundles")]
+        if bundle_names:
+            command += ["--bundle-name", "(?:" + "|".join(re.escape(name) for name in sorted(bundle_names)) + ")$"]
+        if base_vfs_path:
+            command[4:4] = ["--base-vfs", str(base_vfs_path)]
+        subprocess.run(command, check=True, env=env)
+        files = [path for path in staging.rglob("*.png") if path.stem.lower() in {name.lower() for name in requested}]
+        # Flatten only the selected icons, with a deterministic name. Previous
+        # unrelated cache files are retained for the other producers.
+        publication = staging / "publish"
+        publication.mkdir()
+        by_stem = {path.stem.lower(): path for path in files}
+        for name in requested:
+            if name.lower() in by_stem:
+                write_if_changed(publication / f"{name}.png", by_stem[name.lower()].read_bytes())
+        available = {path.stem.lower() for path in files}
+        missing = sorted(name for name in requested if name.lower() not in available)
+        # Do not mark missing/stale requested results as reusable. A later run
+        # can retry without overwriting the current valid metadata.
+        if missing:
+            raise RuntimeError(f"{len(missing)} requested icons could not be extracted; cache retained")
+        write_if_changed(publication / metadata_path.relative_to(cache_dir),
+                         json.dumps({"producerKey": key, "vfsIndexes": identities,
+                                     "names": sorted(names),
+                                     "files": [{"path": f"{name}.png", "size": ((publication / f"{name}.png") if name in requested else (cache_dir / f"{name}.png")).stat().st_size}
+                                               for name in sorted(names)]}, ensure_ascii=False, indent=2))
+        publish_snapshot(publication, cache_dir, ws.path("paths.temp"))
+        return cache_dir
+
+
+def extract_icon_pngs(full_dict: Dict[str, Any], vfs_path: Path,
+                      base_vfs_path: Optional[Path], extractor_path: Path,
+                      cache_dir: Path, threads: int, ws=None) -> Path:
+    referenced = {str(item["iconId"]) for category in ("skills", "weapons", "equipment")
+                  for item in full_dict.get(category, {}).values() if item.get("iconId")}
+    referenced.update(str(item["logoName"]) for item in full_dict.get("suits", {}).values()
+                      if item.get("logoName"))
+    return extract_named_icons(referenced, vfs_path, base_vfs_path, extractor_path, cache_dir, threads, ws)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="BetterEndfieldNext Combat Data Exporter & Incremental Sync Tool"
+    )
+    parser.add_argument("--workspace-config", type=Path)
+    parser.add_argument(
+        "--table-dir",
+        type=Path,
+        help="Path to dumped game tables directory",
+    )
+    parser.add_argument(
+        "--game-path",
+        type=Path,
+        help="Endfield installation root; defaults to the workspace game locator",
+    )
+    parser.add_argument(
+        "--refresh-tables",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refresh Table JSON from current base + hot-update VFS before export",
+    )
+    parser.add_argument(
+        "--table-extractor",
+        type=Path,
+        help="EndfieldStudio CLI with dump --base-vfs support",
+    )
+    parser.add_argument(
+        "--table-threads",
+        type=int,
+        help="Table extraction worker count",
+    )
+    parser.add_argument(
+        "--besem",
+        type=Path,
+        help="Path to combat-semantics.besem file",
+    )
+    parser.add_argument(
+        "--json-data-dir",
+        type=Path,
+        help="Dumped JsonData/Data/Json containing SkillData and BuffData",
+    )
+    parser.add_argument(
+        "--refresh-json-data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refresh SkillData/BuffData from current base + hot-update VFS",
+    )
+    parser.add_argument(
+        "--buff-source-output",
+        type=Path,
+        help="Exact Buff ownership reverse index used by the native recorder",
+    )
+    parser.add_argument(
+        "--base",
+        type=Path,
+        default=None,
+        help="Previous dictionary JSON file for incremental diff comparison",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output full JSON dictionary path",
+    )
+    parser.add_argument(
+        "--ui-output",
+        type=Path,
+        help="Output desktop UI embedded JSON dictionary path",
+    )
+    parser.add_argument(
+        "--min-output",
+        type=Path,
+        help="Output minified JSON dictionary path for web/mobile",
+    )
+    parser.add_argument(
+        "--stage-output",
+        type=Path,
+        help="Output grouped stage table used by the leaderboard navigation",
+    )
+    parser.add_argument(
+        "--stage-map-output",
+        type=Path,
+        help="Output dungeon id -> category id map bundled with the leaderboard function",
+    )
+    parser.add_argument(
+        "--id-registry",
+        type=Path,
+        help="Append-only permanent id registry backing BEC snapshot indices",
+    )
+    parser.add_argument(
+        "--buff-data",
+        type=Path,
+        help="BuffData directory; only the filenames are read, for buff ids",
+    )
+    parser.add_argument(
+        "--icon-source",
+        type=Path,
+        help="PNG asset tree used by this exporter for skill/item/suit icons",
+    )
+    parser.add_argument(
+        "--export-icons",
+        action="store_true",
+        help="Extract referenced PNGs directly from Endfield StreamingAssets",
+    )
+    parser.add_argument(
+        "--fill-missing-icons", action="store_true",
+        help="Extract only referenced icons missing from the web output, using current manifest bundles",
+    )
+    parser.add_argument(
+        "--vfs",
+        type=Path,
+        help="Endfield_Data/StreamingAssets path (or set ENDFIELD_VFS)",
+    )
+    parser.add_argument(
+        "--image-extractor",
+        type=Path,
+        help="Existing Endfield texture extraction CLI",
+    )
+    parser.add_argument(
+        "--icon-cache",
+        type=Path,
+        help="Persistent cache for extracted source PNGs",
+    )
+    parser.add_argument(
+        "--icon-threads",
+        type=int,
+        help="Texture extraction worker count",
+    )
+    parser.add_argument(
+        "--avatar-source",
+        type=Path,
+        help="Existing combat character avatar directory",
+    )
+    parser.add_argument(
+        "--icon-output",
+        type=Path,
+        help="Static web icon output directory",
+    )
+    parser.add_argument(
+        "--verify-icons",
+        action="store_true",
+        help="Fail if any referenced skill/item/suit PNG is missing",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Optional path to output incremental diff report",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Run integrity validation on the generated dictionary",
+    )
+    args = parser.parse_args()
+    ws = load_workspace(args.workspace_config)
+    args.table_threads = args.table_threads if args.table_threads is not None else ws.get("resource_update.table_threads", min(os.cpu_count() or 1, 16))
+    args.icon_threads = args.icon_threads if args.icon_threads is not None else ws.get("resource_update.icon_threads", min(os.cpu_count() or 1, 16))
+    args.game_path = args.game_path or default_game_path(ws)
+    defaults = {
+        "table_dir": ws.path("resource_update.table_root"),
+        "json_data_dir": ws.path("resource_update.json_root"),
+        "output": ws.path("resource_update.outputs.combat_dictionary"),
+        "min_output": ws.path("resource_update.outputs.web_combat_dictionary"),
+        "besem": ws.path("resource_update.outputs.manifests", "combat", "combat-semantics.besem"),
+        "buff_source_output": ws.path("resource_update.outputs.manifests", "combat", "buff-sources.bemap"),
+        "id_registry": ws.root / "tools/CombatDataExporter/id_registry.json",
+        "stage_output": ws.root / "web/src/data/combat-stages.min.json",
+        "stage_map_output": ws.root / "web/cloudbase/functions/combat-api/stage-map.json",
+        "table_extractor": ws.path("paths.toolchains", "EndfieldStudio/AnimeStudio.Endfield.Cli/bin/Release/net9.0/endfield-dump.exe"),
+        "image_extractor": ws.path("paths.toolchains", "EndfieldStudio/AnimeStudio.Endfield.Cli/bin/Release/net9.0/endfield-dump.exe"),
+        "icon_cache": ws.path("paths.cache", "combat-icons"),
+        "icon_output": ws.root / "web/public/icons",
+        "avatar_source": ws.path("resource_update.outputs.avatars"),
+    }
+    for name, fallback in defaults.items():
+        key = ({"table_extractor": "tools.endfield_dump", "image_extractor": "tools.endfield_dump",
+                "id_registry": "resource_update.id_registry"}.get(name)
+               or "resource_update.outputs." + name)
+        if getattr(args, name) is None:
+            setattr(args, name, configured_path(ws, key, fallback))
+    args.buff_data = args.buff_data or args.json_data_dir / "BuffData"
+    args.vfs = args.vfs or default_vfs_path(ws)
+    args.icon_source = args.icon_source or (Path(os.environ["ENDFIELD_ICON_SOURCE"]) if os.environ.get("ENDFIELD_ICON_SOURCE") else None)
+    ws.env()
+
+    print("==========================================================")
+    print("BetterEndfieldNext Combat Data Exporter")
+    print("==========================================================")
+    if args.refresh_tables:
+        if not args.game_path:
+            print("[x] Error: current game installation not found; pass --game-path or use --no-refresh-tables")
+            sys.exit(1)
+        try:
+            refresh_game_tables(
+                args.game_path, args.table_extractor, args.table_dir,
+                args.table_threads, ws,
+            )
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"[x] Error: table refresh failed: {error}")
+            sys.exit(1)
+    else:
+        print("[!] Using offline Table snapshot (--no-refresh-tables)")
+
+    if args.refresh_json_data:
+        if not args.game_path:
+            print("[x] Error: current game installation not found; pass --game-path or use --no-refresh-json-data")
+            sys.exit(1)
+        try:
+            refresh_game_json_data(
+                args.game_path, args.table_extractor, args.json_data_dir,
+                args.table_threads, ws,
+            )
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"[x] Error: JsonData refresh failed: {error}")
+            sys.exit(1)
+    else:
+        print("[!] Using offline combat JsonData snapshot (--no-refresh-json-data)")
+
+    print(f"[*] Game Table Directory: {args.table_dir.resolve()}")
+
+    if not args.table_dir.exists():
+        print(f"[x] Error: Table directory {args.table_dir} does not exist.")
+        sys.exit(1)
+
+    reader = GameTableReader(args.table_dir)
+    chars = extract_characters(reader)
+    skills, talents = extract_skills_and_talents(reader)
+    weapons = extract_weapons(reader)
+    suits = extract_suits(reader)
+    equipment = extract_equipment(reader)
+    dungeons, series = extract_dungeons_and_series(reader)
+    buffs = extract_buff_semantics(args.besem)
+    try:
+        buff_sources, buff_source_stats, skill_buff_edges = build_buff_source_index(
+            reader, args.json_data_dir, ws.path("resource_update.memorypack_schema")
+        )
+        write_buff_source_map(
+            args.buff_source_output, buff_sources, buff_source_stats,
+            skill_buff_edges
+        )
+        print(
+            f"[+] Buff source map saved to: {args.buff_source_output} "
+            f"({buff_source_stats['mappedBuffs']} buffs, "
+            f"{buff_source_stats['candidateRows']} exact candidates, "
+            f"{buff_source_stats['skillBuffEdges']} skill-buff edges)"
+        )
+    except (OSError, ValueError) as error:
+        print(f"[x] Error: Buff source map generation failed: {error}")
+        sys.exit(1)
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    metadata = {
+        "schemaVersion": 1,
+        "generator": "CombatDataExporter v1.0",
+        "exportedAt": now_utc,
+        "source": load_table_source_metadata(args.table_dir),
+        "counts": {
+            "characters": len(chars),
+            "skills": len(skills),
+            "talents": len(talents),
+            "weapons": len(weapons),
+            "suits": len(suits),
+            "equipment": len(equipment),
+            "dungeons": len(dungeons),
+            "dungeonSeries": len(series),
+            "buffs": len(buffs),
+            "buffSourceMappings": buff_source_stats["mappedBuffs"],
+            "buffSourceCandidates": buff_source_stats["candidateRows"],
+        },
+        "buffSourceIndex": buff_source_stats,
+    }
+
+    full_dict = {
+        "metadata": metadata,
+        "characters": chars,
+        "skills": skills,
+        "talents": talents,
+        "weapons": weapons,
+        "suits": suits,
+        "equipment": equipment,
+        "dungeons": dungeons,
+        "dungeonSeries": series,
+        "buffs": buffs,
+    }
+
+    previous = read_metadata(args.output)
+    for key, value in previous.items():
+        if key not in full_dict:
+            full_dict[key] = value
+    old_metadata = previous.get("metadata", {})
+    for key, value in old_metadata.items():
+        if key not in metadata:
+            metadata[key] = value
+    if {**previous, "metadata": {k: v for k, v in old_metadata.items() if k != "exportedAt"}} == {**full_dict, "metadata": {k: v for k, v in metadata.items() if k != "exportedAt"}}:
+        metadata["exportedAt"] = old_metadata.get("exportedAt", now_utc)
+
+    if args.verify:
+        assert len(chars) > 20, "Characters count too low"
+        assert len(weapons) > 30, "Weapons count too low"
+        assert len(dungeons) > 100, "Dungeons count too low"
+
+    # Incremental diff against previous dictionary only if report path is explicitly specified
+    if args.report:
+        base_file = args.base if args.base else (args.output if args.output.exists() else None)
+        if base_file and base_file.exists():
+            try:
+                with open(base_file, "r", encoding="utf-8") as f:
+                    prev_data = json.load(f)
+                diff = compute_incremental_diff(prev_data, full_dict)
+                old_diff = read_metadata(args.report)
+                if {k: v for k, v in old_diff.items() if k != "timestamp"} == {k: v for k, v in diff.items() if k != "timestamp"}:
+                    diff["timestamp"] = old_diff.get("timestamp", diff["timestamp"])
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                write_if_changed(args.report, json.dumps(diff, ensure_ascii=False, indent=2))
+                print(f"[+] Incremental Report saved to: {args.report}")
+                print(f"    Added: {diff['summary']['totalAdded']}, Modified: {diff['summary']['totalModified']}, Removed: {diff['summary']['totalRemoved']}")
+            except Exception as e:
+                print(f"[!] Warning: Failed to compute incremental diff: {e}")
+
+    # Write full JSON
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    write_if_changed(args.output, json.dumps(full_dict, ensure_ascii=False, indent=2))
+    print(f"[+] Full Dictionary saved to: {args.output} ({args.output.stat().st_size / 1024:.1f} KB)")
+
+    # Write UI Embedded JSON
+    if args.ui_output:
+        args.ui_output.parent.mkdir(parents=True, exist_ok=True)
+        write_if_changed(args.ui_output, json.dumps(full_dict, ensure_ascii=False, indent=2))
+        print(f"[+] UI Embedded Dictionary saved to: {args.ui_output} ({args.ui_output.stat().st_size / 1024:.1f} KB)")
+
+    # Permanent ids, so BEC snapshot indices keep their meaning across exports.
+    ids, lookup = load_id_registry(args.id_registry)
+    buff_ids = discover_buff_ids(args.buff_data)
+    added = register_ids(ids, lookup, collect_registry_ids(full_dict, buff_ids))
+    args.id_registry.parent.mkdir(parents=True, exist_ok=True)
+    write_if_changed(args.id_registry, json.dumps({"version": len(ids), "ids": ids}, ensure_ascii=False, separators=(",", ":")))
+    print(f"[+] Id registry: {len(ids)} ids (+{added} new, {len(buff_ids)} buff ids) -> {args.id_registry}")
+
+    # Write minified JSON
+    args.min_output.parent.mkdir(parents=True, exist_ok=True)
+    min_dict = create_minified_web_dict(full_dict)
+    # The id table is only needed when a BEC snapshot is encoded or decoded, so
+    # it ships as its own lazily-imported file rather than inside the bundle.
+    min_dict["idv"] = len(ids)
+    id_output = args.min_output.with_name("combat-ids.min.json")
+    write_if_changed(id_output, json.dumps({"version": len(ids), "ids": ids}, ensure_ascii=False, separators=(",", ":")))
+    print(f"[+] Id table saved to: {id_output} ({id_output.stat().st_size / 1024:.1f} KB)")
+    write_if_changed(args.min_output, json.dumps(min_dict, ensure_ascii=False, separators=(",", ":")))
+    print(f"[+] Minified Web Dictionary saved to: {args.min_output} ({args.min_output.stat().st_size / 1024:.1f} KB)")
+
+    # Stage table for the leaderboard navigation
+    if args.stage_output:
+        stage_table = build_stage_table(full_dict)
+        args.stage_output.parent.mkdir(parents=True, exist_ok=True)
+        write_if_changed(args.stage_output, json.dumps(stage_table, ensure_ascii=False, separators=(",", ":")))
+        print(f"[+] Stage table saved to: {args.stage_output} "
+              f"({len(stage_table['stages'])} stages in {len(stage_table['cats'])} categories)")
+
+        # The leaderboard backend groups records by category, so the function
+        # needs the same dungeon -> category mapping the web bundle has. Names
+        # stay out of it; the function never renders anything.
+        if args.stage_map_output:
+            stage_map = {stage_id: value["c"] for stage_id, value in stage_table["stages"].items()}
+            args.stage_map_output.parent.mkdir(parents=True, exist_ok=True)
+            write_if_changed(args.stage_map_output, json.dumps(stage_map, ensure_ascii=False, separators=(",", ":")))
+            print(f"[+] Stage map saved to: {args.stage_map_output} ({len(stage_map)} stages)")
+
+    icon_source = args.icon_source
+    if icon_source is None and args.icon_cache.exists():
+        icon_source = args.icon_cache
+    if args.export_icons:
+        if not args.vfs:
+            print("[x] Error: Endfield StreamingAssets not found; pass --vfs or set ENDFIELD_VFS")
+            sys.exit(1)
+        try:
+            icon_vfs = args.vfs
+            icon_base_vfs = None
+            if args.game_path:
+                base_root = args.game_path / "Endfield_Data/StreamingAssets"
+                persistent_root = args.game_path / "Endfield_Data/Persistent"
+                if (persistent_root / "VFS").is_dir():
+                    icon_vfs = persistent_root
+                    icon_base_vfs = base_root
+            icon_source = extract_icon_pngs(
+                full_dict,
+                icon_vfs,
+                icon_base_vfs,
+                args.image_extractor,
+                args.icon_cache,
+                args.icon_threads, ws,
+            )
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"[x] Error: icon extraction failed: {error}")
+            sys.exit(1)
+    icon_manifest = export_web_icons(
+        full_dict, icon_source, args.avatar_source, args.icon_output,
+        refresh_existing=args.export_icons,
+    )
+    missing_icon_names = {name for names in icon_manifest["missing"].values() for name in names}
+    if args.fill_missing_icons and missing_icon_names:
+        if not args.game_path:
+            raise ValueError("Missing icon extraction requires a current game installation")
+        base_root = args.game_path / "Endfield_Data/StreamingAssets"
+        persistent_root = args.game_path / "Endfield_Data/Persistent"
+        use_overlay = (persistent_root / "VFS").is_dir()
+        icon_source = extract_named_icons(
+            missing_icon_names, persistent_root if use_overlay else base_root,
+            base_root if use_overlay else None, args.image_extractor,
+            args.icon_cache, args.icon_threads, ws,
+        )
+        icon_manifest = export_web_icons(full_dict, icon_source, args.avatar_source, args.icon_output)
+    if args.verify_icons:
+        missing_icons = sum(len(items) for items in icon_manifest["missing"].values())
+        if missing_icons:
+            print(f"[x] Error: {missing_icons} referenced icons could not be exported")
+            sys.exit(1)
+
+    print("==========================================================")
+    print("Export complete!")
+
+
+if __name__ == "__main__":
+    main()

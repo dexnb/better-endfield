@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Build a per-language Better Endfield voice catalog from local PCK files.
+
+The catalog contains only the media needed by the selected voice manifest. It
+is generated on the user's machine and is never compiled into a module.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import struct
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from workspace_config import load_workspace, producer_key, write_if_changed
+from RefreshEndfieldResourceInputs import configured_path, publish_snapshot, read_metadata, tool_revision
+
+ROOT = Path(__file__).resolve().parents[1]
+GENERATOR = ROOT / "scripts" / "GenerateResourceManifests.py"
+LANGUAGES = ("Chinese", "English", "Japanese", "Korean")
+MAGIC = b"BEVCAT01"
+HEADER = struct.Struct("<8sHHIIQQ")
+ENTRY = struct.Struct("<IIQII")
+DURATION_COUNT = struct.Struct("<I")
+DURATION_VALUE = struct.Struct("<f")
+
+
+def load_generator() -> Any:
+    spec = importlib.util.spec_from_file_location("better_endfield_manifest", GENERATOR)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load {GENERATOR}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workspace-config", type=Path)
+    parser.add_argument("--game-path", type=Path)
+    parser.add_argument(
+        "--package-path",
+        type=Path,
+        help=(
+            "explicit local PCK/CHK payload to read instead of the source path "
+            "recorded in the manifest (for another validated client platform)"
+        ),
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+    )
+    parser.add_argument("--language", choices=LANGUAGES, required=True)
+    parser.add_argument("--character-id", default="")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    args.workspace = ws = load_workspace(args.workspace_config)
+    args.game_path = args.game_path or ws.path("game.install_dir", required=False)
+    args.manifest = args.manifest or ws.path("resource_update.outputs.manifests", "voice", "voice-event-media-manifest.json")
+    catalogs = configured_path(ws, "resource_update.outputs.voice_catalog_root",
+                               ws.path("paths.generated", "voice", "catalogs"))
+    args.output = args.output or catalogs / f"{args.character_id or 'all'}-{args.language}.bevcat"
+    return args
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8-sig") as stream:
+        return json.load(stream)
+
+
+def source_path(game_path: Path | None, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() and game_path is None:
+        raise ValueError("Configure game.install_dir or pass --game-path/--package-path")
+    return path if path.is_absolute() else game_path / path
+
+
+def target_packages_for(
+    manifest: dict[str, Any], language: str
+) -> list[dict[str, Any]]:
+    target_packages = [
+        item
+        for item in manifest.get("pckPackages", [])
+        if item.get("mappingLanguage") == language
+    ]
+    if not target_packages:
+        raise ValueError(f"no PCK package is recorded for {language}")
+    return target_packages
+
+
+def target_package_for(manifest: dict[str, Any], language: str) -> dict[str, Any]:
+    return target_packages_for(manifest, language)[0]
+
+
+def collect_routes(
+    manifest: dict[str, Any], language: str, character_id: str = ""
+) -> tuple[dict[tuple[int, int], int], int]:
+    routes: dict[tuple[int, int], int] = {}
+    voice_count = 0
+    for voice in manifest.get("voices", []):
+        if character_id and voice.get("characterId") != character_id:
+            continue
+        mappings = {
+            mapping.get("language"): mapping
+            for mapping in voice.get("languageMappings", [])
+            if mapping.get("language") and mapping.get("soundSlots")
+        }
+        target_mapping = mappings.get(language)
+        if not target_mapping:
+            continue
+        target_slots = {
+            int(slot["soundObjectId"]): int(slot["mediaId"])
+            for slot in target_mapping.get("soundSlots", [])
+            if slot.get("soundObjectId") is not None and slot.get("mediaId")
+        }
+        if not target_slots:
+            continue
+        voice_count += 1
+        for source_language, mapping in mappings.items():
+            source_language_index = LANGUAGES.index(source_language)
+            for slot in mapping.get("soundSlots", []):
+                sound_id = int(slot.get("soundObjectId", 0))
+                source_id = int(slot.get("mediaId", 0))
+                target_id = target_slots.get(sound_id)
+                key = (source_language_index, source_id)
+                if source_id and target_id and key not in routes:
+                    routes[key] = target_id
+    return routes, voice_count
+
+
+def collect_voice_sources(
+    manifest: dict[str, Any], language: str, character_id: str
+) -> dict[str, list[int]]:
+    sources: dict[str, list[int]] = {}
+    for voice in manifest.get("voices", []):
+        if character_id and voice.get("characterId") != character_id:
+            continue
+        identities = [
+            str(value)
+            for value in (voice.get("voiceId"), voice.get("audioDialogKey"))
+            if value is not None and str(value)
+        ]
+        media: set[int] = set()
+        for mapping in voice.get("languageMappings", []):
+            if mapping.get("language") != language:
+                continue
+            media.update(
+                int(slot["mediaId"]) & 0xFFFFFFFF
+                for slot in mapping.get("soundSlots", [])
+                if slot.get("mediaId")
+            )
+            media.update(
+                int(media_id) & 0xFFFFFFFF
+                for media_id in mapping.get("mediaIds", [])
+                if media_id
+            )
+        if media:
+            for identity in identities:
+                sources[identity] = sorted(media)
+    return sources
+
+
+def wem_duration_seconds(payload: bytes) -> float:
+    if len(payload) < 32 or payload[:4] != b"RIFF" or payload[8:12] != b"WAVE":
+        return 0.0
+    sample_rate = 0
+    average_bytes_per_second = 0
+    position = 12
+    while position + 8 <= len(payload):
+        chunk_id = payload[position : position + 4]
+        chunk_size = struct.unpack_from("<I", payload, position + 4)[0]
+        available = min(chunk_size, len(payload) - position - 8)
+        data = position + 8
+        if chunk_id == b"fmt " and available >= 16:
+            sample_rate = struct.unpack_from("<I", payload, data + 4)[0]
+            average_bytes_per_second = struct.unpack_from("<I", payload, data + 8)[0]
+            if available >= 28 and sample_rate:
+                sample_count = struct.unpack_from("<I", payload, data + 24)[0]
+                if sample_count:
+                    return sample_count / sample_rate
+        elif chunk_id == b"data" and average_bytes_per_second:
+            return available / average_bytes_per_second
+        position += 8 + ((chunk_size + 1) & ~1)
+    return 0.0
+
+
+def build_catalog(args: argparse.Namespace) -> dict[str, Any]:
+    generator = load_generator()
+    manifest = load_json(args.manifest)
+    if manifest.get("kind") != "endfield-voice-event-media-manifest":
+        raise ValueError("voice manifest kind is not recognized")
+    if args.language not in LANGUAGES:
+        raise ValueError(f"unsupported target language {args.language}")
+
+    target_packages = target_packages_for(manifest, args.language)
+    target_paths = (
+        [args.package_path.resolve()]
+        if args.package_path is not None
+        else [source_path(args.game_path, item["source"]) for item in target_packages]
+    )
+    for target_path in target_paths:
+        if not target_path.is_file():
+            raise FileNotFoundError(target_path)
+    target_indexes = [
+        generator.parse_pck(target_path, args.game_path) for target_path in target_paths
+    ]
+    # A CHK name is the VFS content identity. Arbitrary mutable PCK files are
+    # regenerated in memory instead of being trusted by path/size alone.
+    import re
+    identity = [{"path": str(path.resolve()), "vfsContentId": path.stem.upper(),
+                 "headerSha256": index.header_sha256, "size": index.size}
+                for path, index in zip(target_paths, target_indexes)]
+    key = producer_key(identity, tool_revision([Path(__file__), GENERATOR]),
+                       {"manifestSha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
+                        "language": args.language, "characterId": args.character_id})
+    report_path = args.output.with_suffix(args.output.suffix + ".json")
+    previous = read_metadata(report_path)
+    immutable = all(path.suffix.lower() == ".chk" and re.fullmatch(r"[0-9a-fA-F]{32}", path.stem)
+                    for path in target_paths)
+    if immutable and previous.get("producerKey") == key and args.output.is_file() \
+            and args.output.stat().st_size == previous.get("catalogBytes"):
+        return previous
+    target_media: dict[int, tuple[Any, Any]] = {}
+    for target_index in target_indexes:
+        for entry in target_index.media:
+            if entry.file_id <= 0xFFFFFFFF:
+                target_media.setdefault(entry.file_id & 0xFFFFFFFF, (target_index, entry))
+
+    routes, voice_count = collect_routes(
+        manifest, args.language, args.character_id
+    )
+    missing = 0
+    available_routes: dict[tuple[int, int], int] = {}
+    for route_key, target_id in routes.items():
+        if target_id not in target_media:
+            missing += 1
+            continue
+        available_routes[route_key] = target_id
+    if missing:
+        raise ValueError(
+            f"{missing} target Media IDs are absent from the selected PCK"
+        )
+    if not available_routes:
+        raise ValueError("the requested speaker/language produced no media routes")
+
+    payloads = {
+        target_id: generator.read_pck_payload(*target_media[target_id])
+        for target_id in sorted(set(available_routes.values()))
+    }
+
+    entry_offset = HEADER.size
+    data_offset = entry_offset + ENTRY.size * len(available_routes)
+    data = bytearray()
+    payload_offsets: dict[int, int] = {}
+    for target_id, payload in payloads.items():
+        payload_offsets[target_id] = data_offset + len(data)
+        data.extend(payload)
+    durations: dict[str, float] = {}
+    for identity, source_ids in collect_voice_sources(
+        manifest, args.language, args.character_id
+    ).items():
+        longest = max(
+            (
+                wem_duration_seconds(payloads[target_id])
+                for source_id in source_ids
+                for (_, route_source_id), target_id in available_routes.items()
+                if route_source_id == source_id and target_id in payloads
+            ),
+            default=0.0,
+        )
+        if longest > 0:
+            durations[identity] = longest
+    duration_offset = data_offset + len(data)
+    duration_table = bytearray(DURATION_COUNT.pack(len(durations)))
+    for identity, seconds in sorted(durations.items()):
+        encoded = identity.encode("utf-8")
+        duration_table.extend(DURATION_COUNT.pack(len(encoded)))
+        duration_table.extend(encoded)
+        duration_table.extend(DURATION_VALUE.pack(seconds))
+    packed_entries = bytearray()
+    for (source_language, source_id), target_id in sorted(available_routes.items()):
+        payload = payloads[target_id]
+        packed_entries.extend(
+            ENTRY.pack(
+                source_id, target_id, payload_offsets[target_id], len(payload),
+                source_language
+            )
+        )
+
+    header = HEADER.pack(
+        MAGIC,
+        3,
+        LANGUAGES.index(args.language),
+        len(available_routes),
+        duration_offset,
+        entry_offset,
+        data_offset,
+    )
+    catalog = header + packed_entries + data + duration_table
+    digest = hashlib.sha256(catalog).hexdigest().upper()
+    report = {
+        "schemaVersion": 3,
+        "kind": "betterendfield-voice-catalog",
+        "catalogVersion": 3,
+        "targetLanguage": args.language,
+        "characterId": args.character_id or "*",
+        "entryCount": len(available_routes),
+        "durationIdentityCount": len(durations),
+        "uniqueTargetMediaCount": len(payloads),
+        "payloadBytes": len(data),
+        "voiceCount": voice_count,
+        "missingTargetMediaCount": missing,
+        "catalogSha256": digest,
+        "catalogBytes": len(catalog),
+        "producerKey": key,
+        "sourceManifest": str(args.manifest),
+        "sourcePackage": str(target_paths[0]),
+        "sourcePackages": [str(path) for path in target_paths],
+    }
+    ws = getattr(args, "workspace", None) or load_workspace()
+    ws.env()
+    with tempfile.TemporaryDirectory(prefix="voice-catalog-", dir=ws.path("paths.temp")) as temporary:
+        staging = Path(temporary)
+        write_if_changed(staging / args.output.name, catalog)
+        write_if_changed(staging / report_path.name, json.dumps(report, ensure_ascii=True, indent=2) + "\n")
+        publish_snapshot(staging, args.output.parent, ws.path("paths.temp"))
+    return report
+
+
+def main() -> int:
+    args = parse_args()
+    report = build_catalog(args)
+    print(json.dumps(report, ensure_ascii=True, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

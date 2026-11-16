@@ -1,0 +1,246 @@
+bin/
+obj/
+artifacts/
+/research/
+!native/research/
+!native/research/music_probe/
+!native/research/music_probe/*.cpp
+!native/research/music_probe/*.ini
+runs/*
+state/*
+Maps/
+vendor/
+# The DSH bundle vendors its BCn decoder in-tree: no build step can fetch it, and
+# the client bundle cannot be rebuilt from a clone without it.
+!tools/CustomModel/dsh-plugin/lib/vendor/
+!tools/CustomModel/dsh-plugin/lib/vendor/**
+dependencies.lock.json
+
+# Research-only applications and extraction tools are not part of the mod repo.
+src/Diagnostics/
+src/*Ctl/
+src/*Probe/
+/tests/
+tools/EndfieldDumper/
+tools/EndfieldStudio/
+tools/EndfieldUnpacker/
+tools/FkArkEnd/
+tools/MetadataScan/
+tools/CombatDataExporter/.icon-cache/
+
+# Keep only the scripts needed to build the distributable mod.
+scripts/*
+!scripts/BuildBemTools.ps1
+!scripts/BuildBemCliAndroid.ps1
+!scripts/BuildDshPlugin.py
+!scripts/BuildResourcePacks.py
+!scripts/PublishResourceRelease.py
+!scripts/ExportDeviceResources.py
+!scripts/BuildPreviewResources.py
+!scripts/BuildBetterEndfieldNext.ps1
+!scripts/BuildWeb.ps1
+!scripts/PublishRelease.py
+!scripts/BuildInstaller.ps1
+!scripts/PrepareBemArchiveBackend.ps1
+!scripts/PrepareEndfieldDump.ps1
+!scripts/BuildVoiceCatalog.py
+!scripts/GenerateVoiceCatalogIndex.py
+!scripts/GenerateModCharacterPresets.py
+!scripts/GenerateResourceManifests.py
+!scripts/RefreshEndfieldResourceInputs.py
+!scripts/ScanCharacterAssets.py
+!scripts/UpdateResourceManifests.ps1
+!scripts/UpdateCombatAvatars.py
+!scripts/GenerateBemBaselineTable.py
+# CI entry points: thin wrappers the release workflow calls. Kept tracked so the
+# workflow and the local build can never drift into two different procedures.
+!scripts/ci/
+!scripts/ci/*.ps1
+
+# Native build outputs.
+native/build/
+native/shared/third_party/minhook/build/
+
+vendor/tools/
+vendor/wwiser/
+vendor/unity-libs-2021.3.34/
+*.user
+*.suo
+*.log
+*.pdb
+BetterEndfieldNext.ini
+diagnostics/
+
+# Local reverse-engineering helpers are not distributable project sources.
+/ida_inspect_eftool.py
+/idat-local.exe
+
+# CMake build tree and local tooling output.
+build/
+output/
+.playwright-cli/
+node_modules/
+*.tsbuildinfo
+dist/
+
+# CloudBase CLI deploy state
+web/cloudbase/.tcb/
+web/cloudbase/functions/*/node_modules/
+
+# Scratch analysis output: multi-gigabyte sample records and build logs.
+tmp_analysis/
+.zcode/
+# Carries COMBAT_DATA_KEY, the path segment guarding the bucket's private half.
+web/cloudbase/cloudbaserc.json
+
+# Python bytecode. The copy under legacy/ stays tracked: it is part of a
+# historical source snapshot, and gitignore does not untrack what is already in.
+__pycache__/
+*.pyc
+
+# Keep native tests and curated BEM research while excluding raw local databases.
+!native/tests/
+!scripts/BuildBemTools.ps1
+!/research/
+/research/*
+!/research/README.md
+!/research/custom-model/
+!/research/custom-model/**
+!/research/postmodel-focused/
+!/research/postmodel-focused/**
+/research/postmodel-focused/*.i64
+/research/postmodel-focused/__pycache__/
+/research/postmodel-focused/*.log
+
+# Workspace-local settings, inputs, tools and reproducible outputs.
+/config/workspace.local.json
+/config/android-signing.local.properties
+/config/android-next-signing.local.properties
+!scripts/InitializeNextSigning.ps1
+!scripts/SignNextRelease.ps1
+!scripts/ObfuscateNext.ps1
+!scripts/BuildBetterEndfieldNext.ps1
+!scripts/tests/test_next_identity.py
+/config/secrets/
+*.keystore
+*.jks
+*.p12
+*.pfx
+/config/*.local.json
+/inputs/
+/toolchains/
+/temp/
+/cache/
+/releases/
+# Extracted game data. Regenerated from a local game install, or restored from the
+# private input store; never distribution content, never committed.
+/resources/generated/
+/android/resources/character-presets.json
+/android/resources/voice-catalog-index.json
+/android/resources/manifests/
+/manifests/model/
+/manifests/voice/
+/manifests/combat/buff-sources.bemap
+/manifests/combat/combat-dictionary.json
+/manifests/combat/combat-semantics.besem
+/manifests/combat/combat-semantics-report.json
+/manifests/shared/resource-manifest-report.md
+# Retired 2.x archives (IL2CPP dumps, animation clips, extracted tables) stay on
+# disk as reference material but are not distribution content.
+/legacy/
+
+# Workspace maintenance entry points and suite metadata.
+!scripts/workspace_config.py
+!scripts/game_discovery.py
+!scripts/workspace_doctor.py
+!scripts/Workspace.ps1
+!scripts/Clean-Workspace.ps1
+!scripts/Test-Workspace.ps1
+!scripts/run_workspace_tests.py
+!scripts/migrate_workspace.py
+!scripts/migrate_research.py
+!scripts/migrate_documents.py
+!scripts/tests/
+!scripts/tests/**
+
+# Keep research notes/scripts, exclude large local captures from Git.
+!/research/
+!/research/*/
+!/research/*/*/
+!/research/*/*/*/
+!/research/*/*/*/**/
+!/research/**/*.md
+!/research/**/*.py
+!/research/**/*.ps1
+!/research/**/source.json
+/research/**/*.i64
+/research/**/*.id0
+/research/**/*.id1
+/research/**/bin/
+/research/**/obj/
+/research/**/CMakeFiles/
+/research/**/node_modules/
+/research/**/__pycache__/
+
+# Research working data stay local; maintainable notes and scripts are tracked.
+/research/**
+!/research/**/
+!/research/**/*.md
+!/research/**/*.py
+!/research/**/*.ps1
+!/research/**/*.sh
+!/research/**/source.json
+!/research/**/backend-patch.json
+/research/**/node_modules/**
+/research/**/__pycache__/**
+/research/**/bin/**
+/research/**/obj/**
+/research/**/CMakeFiles/**
+
+# Imported upstream ignore rules are reference material, not workspace policy.
+/research/**/.upstream-gitignore
+!/research/**/*.cpp
+!/research/**/*.c
+!/research/**/*.h
+!/research/**/*.hpp
+!/research/**/*.cs
+!/research/**/*.csproj
+!/research/**/CMakeLists.txt
+!/research/**/*.recipe.json
+!/research/**/*.profile.json
+!/research/**/*.mapping.json
+/research/host/**/host-il2cpp/**
+/research/host/**/legacy-analysis-state/**
+/research/**/*.lib
+/research/**/*.dll
+/research/**/*.exe
+/research/**/*.log
+/research/**/*.pdb
+
+# Decompiled game source is retained local input, not maintained project code.
+/research/**/IL2CPP_Dump_*/**
+/research/**/Normal/**
+/research/**/AI/**
+/research/host/**/legacy-source-research/runs/**
+
+/research/**/generated/**
+/research/camera/**/renodx/src/games/**/assets/**
+/research/actions/mhw-longsword/**
+
+# Unity editor/import caches are reproducible, not research source.
+/research/**/Library/**
+/research/**/Temp/**
+/research/**/Logs/**
+/research/**/UserSettings/**
+
+# These remain ignored after explicit maintenance-script inclusion rules.
+/scripts/**/__pycache__/
+/scripts/**/*.pyc
+
+# AI 会话与本地工作区目录不进入版本库（docs/workspace/COMMIT_POLICY.md）。
+/.workbuddy/
+/.workbuddy-ai/
+!scripts/CheckDistributionIndex.py
+
+# Release host deployment (keys and host layout live there, not in the repo)
+/deploy/

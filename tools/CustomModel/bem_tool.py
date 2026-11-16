@@ -1,0 +1,474 @@
+"""Creator CLI: inspect, convert, pack, validate BEM 1.0..1.4. Never executes source INI/shaders."""
+from __future__ import annotations
+import argparse
+import contextlib
+import io
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import bem_v1 as bem
+import bem_projects
+
+TOOL_VERSION = "1.6.8"
+FORMAT_VERSIONS = {0: '1.0', 1: '1.1', 2: '1.2', 3: '1.3', 4: '1.4', 5: '1.5'}
+from convert_efmi_poc import Source
+from efmi_source import sections, analyze_source
+from efmi_lod_source import ENTRY, inspect_lod_source
+from source_classification import entry_family, classify
+
+
+def archive_backend_available():
+    """Slim distributions (the Android CLI) ship without the bundled 7-Zip backend."""
+    try:
+        import source_archive  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def inspect_source(path, explicit=None, *, prepared=None):
+    path = Path(path)
+    if path.suffix.lower() == '.bem':
+        m, _ = bem.read_package(path, decode=False)
+        version = FORMAT_VERSIONS[bem.package_minor(path)]
+        return dict(format='BEMv' + version, format_version=version,
+                    package=m, entries=[], issues=[], conversion_ready=False)
+    if path.is_file() and path.suffix.lower() not in ('.zip','.rar','.7z'):
+        formats = '目录、ZIP、RAR 和 7z' if archive_backend_available() else '目录和 ZIP（此发行版不含 RAR/7z 后端）'
+        raise ValueError(f'ARCHIVE_FORMAT: 源 Mod 支持{formats}。')
+    if path.suffix.lower() == '.zip' and bem_projects.has_package_manifest(path):
+        package = bem_projects.read_zip_package(path)
+        m = package['manifest']
+        return dict(format='BEM-ZIP-PACKAGE', format_version=str(m.get('format_version', '1.0')),
+                    package=m, entries=[], issues=[], conversion_ready=False,
+                    payload_count=len(package['payloads']), wrapper=package['prefix'])
+    if path.suffix.lower() == '.zip' and bem_projects.has_bem_members(path):
+        return bem_projects.inspect_bundle(path)
+    src = Source(path)
+    try:
+        candidates=[]
+        documents=[]
+        for name in src.names:
+            if not name.lower().endswith('.ini') or any(p.lower().startswith('disabled') or p.lower() in ('backup','backups') for p in Path(name).parts):
+                continue
+            sec=sections(src.read_exact(name).decode('utf-8-sig'))
+            documents.append((name,sec))
+            family=entry_family(sec)
+            if family: candidates.append((name,family,sec))
+        if explicit:
+            candidates=[c for c in candidates if c[0]==explicit]
+        result=dict(format='unknown', entries=[dict(ini=n,format=f) for n,f,_ in candidates], issues=[], conversion_ready=False)
+        if len(candidates)!=1:
+            result['issues'].append(dict(code='ENTRY_SELECTION',message=f'找到 {len(candidates)} 个入口；请在配方指定 ini。'))
+            return result
+        name,kind,sec=candidates[0]; result.update(format=kind,ini=name)
+        result['automation']=classify(kind,documents)
+        if kind=='mixed':
+            result['issues'].append(dict(code='MIXED_ENTRY',message='混合入口需要专门适配。'))
+            return result
+        if kind=='hash-lod':
+            result['analysis']=inspect_lod_source(src,name,sec)
+            # The older inspector labels implementation requirements as blockers.
+            # The unified tool supports these via profiles; only unresolved source
+            # semantics should be described as unsupported.
+            analysis=result['analysis']
+            analysis['requirements']=analysis.pop('blockers')
+            analysis['errors']=analysis['structural_errors']
+            result['issues'].extend(dict(code='SOURCE_STRUCTURE',message=e) for e in analysis['structural_errors'])
+        else:
+            result['analysis']=analyze_source(src,name)
+        if result['automation']['status']=='manual_only':
+            result['issues'].extend(dict(code='MANUAL_ADAPTATION',message=r) for r in result['automation']['reasons'])
+        elif kind=='component-n' and result['automation']['status']=='standard_candidate':
+            from component_auto import prepare
+            try:
+                if any(n!=name and any(k.startswith(('TextureOverride','CommandList','Resource')) for k in s) for n,s in documents):
+                    raise ValueError('COMPANION_INI: 多个活动 INI 共同定义资源或逻辑，需专门审阅。')
+                builder, matching=prepare(src,name)
+                result.update(conversion_ready=True,matching=matching)
+                result['automation'].update(status='ready',conversion_ready=True,
+                    note='已自动匹配角色资料并完成默认外观的完整结构校验；显示效果需实机确认。')
+                result['analysis']['errors']=[]
+                result['issues'].extend(matching['warnings'])
+                if prepared is not None: prepared.append(builder)
+            except (ValueError, KeyError, OSError) as exc:
+                message=str(exc)
+                result['issues'].append(dict(code=message.split(':',1)[0] if ':' in message else 'AUTO_CONVERSION',message=message))
+        else:
+            result['issues'].append(dict(code='AUTO_MAPPING_PENDING',message='此来源需要骨架与材质映射，暂未接入自动转换。'))
+        return result
+    finally:
+        src.close()
+
+
+def check_geometry(m, payloads, minor=None):
+    """Creator-side data checks; runtime independently checks selected dependencies.
+
+    `minor` is the package header minor when validating a written package.
+    """
+    if 'option_groups' in m:
+        import bem_v11
+        import bem_v13
+        summary = (bem_v13.check_geometry(m, payloads, minor) if bem_v13.used(m)
+                   else bem_v11.check_geometry(m, payloads, minor))
+        bem.require(minor is None or minor >= summary['required_minor'],
+                    'Package content needs a newer BEM header')
+        return summary
+    import struct
+    for mesh in m['meshes']:
+        for s in mesh['streams']:
+            bem.require(len(payloads[s['payload']]) == mesh['vertex_count']*s['stride'], 'Vertex stream length mismatch')
+        raw=payloads[mesh['indices']]; size=mesh['index_size']
+        bem.require(len(raw)==mesh['index_count']*size, 'Index buffer length mismatch')
+        bem.require(all(i[0]<mesh['vertex_count'] for i in struct.iter_unpack('<H' if size==2 else '<I',raw)), 'Index outside vertices')
+        skin=mesh['streams'][2]; stride=skin['stride']; buf=payloads[skin['payload']]
+        bem.require(stride in (4,12), 'Unsupported skin stride')
+        bem.require(all(b<len(mesh['bones']) for p in range(stride-4,len(buf),stride) for b in buf[p:p+4]), 'Bone index outside palette')
+        if stride==12:
+            bem.require(all(abs(sum(struct.unpack_from('<4H',buf,p))-65535)<=655
+                            for p in range(0,len(buf),stride)), 'Skin weights must sum to 1 (tolerance 0.01)')
+    for t in m['textures']:
+        w,h,n=t['width'],t['height'],t['mips']
+        pixel={4:4,63:1}.get(t['format'],0)
+        astc = t['format'] in (48,49,50)
+        bem.require(0<w<=32768 and 0<h<=32768 and (pixel or astc or (w%4==0 and h%4==0)) and 0<n<=16, 'Invalid texture dimensions')
+        block=8 if t['format'] in (10,26) else 16
+        bw=t['format']-44 if astc else 4
+        size=(sum(max(w>>i,1)*max(h>>i,1)*pixel for i in range(n)) if pixel else
+              sum(((max(w>>i,1)+bw-1)//bw)*((max(h>>i,1)+bw-1)//bw)*block for i in range(n)))
+        bem.require(size<=64*1024**2 and len(payloads[t['payload']])==size, 'Texture mip payload mismatch')
+    for a in m['appearances']:
+        if 'preview' in a:
+            raw=payloads[a['preview']]
+            bem.require(len(raw)<=8*1024**2 and raw.startswith(b'\x89PNG\r\n\x1a\n'), 'Invalid PNG preview')
+        textures=set(); resident=0
+        for c in a['components']:
+            if c['operation']!='replace': continue
+            mesh=m['meshes'][c['mesh']]
+            resident+=sum(len(payloads[s['payload']]) for s in mesh['streams'])+len(payloads[mesh['indices']])
+            for d in mesh['draws']: textures.update(d['textures'])
+        resident+=sum(len(payloads[m['textures'][t]['payload']]) for t in textures)
+        bem.require(len(textures)<=32 and resident<=bem.LIMIT, 'Appearance exceeds 32 texture bindings / 512 MiB budget')
+
+
+def convert(source, recipe_path, output, package=None, deformations=None, game_baseline=None):
+    recipe_path=Path(recipe_path); recipe=bem.load_json(recipe_path); root=recipe_path.parent
+    bem.require(recipe['schema']==1, 'Unsupported conversion recipe schema')
+    def path(v):
+        p=Path(v); return p if p.is_absolute() else root/p
+    deformations = deformations or (path(recipe['deformations']) if recipe.get('deformations') else None)
+    if deformations:
+        from bem_v13 import author_input_paths
+        bem.require(Path(output).resolve() not in author_input_paths(deformations), 'Output cannot overwrite shape input')
+    builder=None; evidence=[]
+    for appearance in recipe['appearances']:
+        source_path=path(appearance['source']) if appearance.get('source') else Path(source)
+        from efmi_shapes import require_shape_binding
+        require_shape_binding(source_path, deformations)
+        profile=bem.load_json(path(appearance['profile'])) if appearance.get('profile') else None
+        kind=appearance.get('format','auto')
+        if kind=='auto':
+            detected=inspect_source(source_path,appearance.get('ini'))
+            bem.require(detected['format']!='unknown', 'ENTRY_SELECTION: 配方需选择入口 ini')
+            bem.require(detected.get('automation',{}).get('status')!='manual_only',
+                        'MANUAL_ADAPTATION: 源包含自定义 Shader、外部材质或其他特殊逻辑，不能自动转换；请使用经审阅的专用转换路线。')
+            kind=detected['format']
+        if kind=='reviewed-draws':
+            from convert_reviewed_draws import prepare
+            from hash_lod_lowering import convert as lower
+            src=Source(source_path)
+            try:
+                reviewed=appearance['reviewed']
+                normalized, ini, profile, ev=prepare(src,
+                    bem.load_json(path(reviewed['recipe'])),bem.load_json(path(reviewed['database'])),
+                    bem.load_json(path(reviewed['observations'])),bem.load_json(path(reviewed['native_textures'])),
+                    path(reviewed['texture_dir']))
+                raw, summary=lower(normalized,ini,profile)
+                evidence.append(dict(appearance=appearance['id'],native_output=summary,evidence=ev))
+            finally: src.close()
+        elif kind=='hash-lod':
+            from hash_lod_lowering import convert as lower
+            from convert_hash_lod import select_ini
+            bem.require(profile is not None, 'TARGET_PROFILE: 缺少已验证原生 profile')
+            src=Source(source_path)
+            try:
+                raw, summary=lower(src,select_ini(src,appearance.get('ini')),profile)
+                evidence.append(dict(appearance=appearance['id'],native_output=summary))
+            finally: src.close()
+        elif kind=='component-n':
+            import convert_efmi_poc
+            bem.require(profile is not None, 'TARGET_PROFILE: ComponentN 需要原生 profile 和显式 v24_draws')
+            with tempfile.TemporaryDirectory(prefix='bem-convert-') as tmp:
+                dest=Path(tmp)/'intermediate.bin'
+                argv=[str(source_path),'-o',str(dest)]
+                for key in ('ini','source_profile','material_profile'):
+                    if appearance.get(key):
+                        argv += ['--'+key.replace('_','-'), appearance[key] if key=='ini' else str(path(appearance[key]))]
+                old=sys.argv
+                try:
+                    sys.argv=['convert_efmi_poc',*argv]
+                    with contextlib.redirect_stdout(io.StringIO()): convert_efmi_poc.main()
+                finally: sys.argv=old
+                raw=dest.read_bytes()
+        else:
+            raise ValueError(f'UNSUPPORTED_FORMAT: {kind}')
+        t=recipe['target']
+        target=bem.target_from_profile(profile,t['character_id'],t['world_resource'],t['ui_resource'],t['profile_id'],t['revision'])
+        if builder is None:
+            p=recipe['package']; builder=bem.Builder(p['id'],p['name'],p['author'],p['version'],target)
+        else:
+            bem.require(builder.m['target']==target,'APPEARANCE_TARGET: 外观的目标契约不同，不能放入同包')
+        builder.add_legacy(raw,profile,appearance['id'],appearance['name'])
+        builder.m['appearances'][-1]['description']=appearance.get('description','')
+        if appearance.get('preview'):
+            data=path(appearance['preview']).read_bytes()
+            bem.require(len(data)<=8*1024**2 and data.startswith(b'\x89PNG\r\n\x1a\n'), 'Preview must be PNG <= 8 MiB')
+            builder.m['appearances'][-1]['preview']=builder.payload(data)
+    bem.require(builder is not None,'No appearances')
+    builder.m['default_appearance_id']=recipe.get('default_appearance_id',builder.m['default_appearance_id'])
+    from bem_export import prepare_builder, package_overrides
+    prepare_builder(builder)
+    from bem_v13 import apply_author_spec
+    builder.m, builder.payloads, deformation_report = apply_author_spec(builder.m, builder.payloads, deformations)
+    package_overrides(builder.m, package)
+    # Section 15: every appearance shares one target, so the last profile read is
+    # also the catalog entry this package was built from.
+    bem.require_game_baseline(builder.m, game_baseline, profile)
+    bem.validate_manifest(builder.m,len(builder.payloads)); check_geometry(builder.m,builder.payloads)
+    builder.write(output)
+    return dict(package=builder.m,evidence=evidence,deformations=deformation_report,size=Path(output).stat().st_size,
+                format_version=FORMAT_VERSIONS[bem.package_minor(output)],
+                conversion_ready=True,render_verified=False,issues=[])
+
+
+def convert_automatic(source, output, ini=None, package=None, deformations=None, game_baseline=None):
+    from efmi_shapes import require_shape_binding
+    require_shape_binding(source, deformations)
+    if deformations:
+        from bem_v13 import author_input_paths
+        bem.require(Path(output).resolve() not in author_input_paths(deformations), 'Output cannot overwrite shape input')
+    prepared=[]
+    inspection=inspect_source(source,ini,prepared=prepared)
+    bem.require(inspection.get('conversion_ready') and len(prepared)==1,
+        '\n'.join(i['message'] for i in inspection.get('issues',[])) or 'AUTO_CONVERSION: 此来源暂不能自动转换')
+    builder=prepared[0]
+    from bem_export import prepare_builder, package_overrides
+    prepare_builder(builder); package_overrides(builder.m, package)
+    from bem_v13 import apply_author_spec
+    builder.m, builder.payloads, deformation_report = apply_author_spec(builder.m, builder.payloads, deformations)
+    # Automatic conversion keeps the matched catalog entry on the builder, so the
+    # baseline still defaults to the source data when the caller omits it.
+    bem.require_game_baseline(builder.m, game_baseline, getattr(builder, 'catalog', None))
+    builder.write(output)
+    return dict(package=builder.m,matching=inspection['matching'],issues=inspection['issues'],deformations=deformation_report,
+        size=Path(output).stat().st_size,format_version=FORMAT_VERSIONS[bem.package_minor(output)],conversion_ready=True,render_verified=False)
+
+
+def baseline_map_default():
+    """The publisher-side batch table that ships beside the repository config."""
+    candidate = Path(__file__).resolve().parents[2] / 'config' / 'game-baseline-map.json'
+    return candidate if candidate.is_file() else None
+
+
+def load_baseline_map(path):
+    """revision -> game_baseline. Entries that do not validate are dropped, not guessed."""
+    data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    table = {}
+    for batch in data.get('batches', []):
+        revision = batch.get('revision')
+        if not isinstance(revision, str) or not revision:
+            continue
+        value = {key: batch[key] for key in ('windows-x64', 'android-arm64', 'hotfix') if key in batch}
+        try:
+            bem.validate_game_baseline({'game_baseline': value})
+        except ValueError:
+            continue
+        table[revision] = value
+    return table
+
+
+def backfill_baselines(source, baseline=None, map_path=None, dry_run=False, output=None):
+    """Add `game_baseline` to packages that predate the field, without repacking.
+
+    The value comes either from an explicit baseline or from the package's own
+    `target.revision` matched against the declared batch table. A revision that
+    the table does not name is reported as unmatched and never guessed: the
+    field is a lookup key, so a wrong value would silently select a wrong repair.
+    """
+    source = Path(source)
+    files = [source] if source.is_file() else sorted(path for path in source.rglob('*.bem'))
+    table = None
+    if baseline is None:
+        known = Path(map_path) if map_path else baseline_map_default()
+        bem.require(known is not None and known.is_file(),
+                    'SET-BASELINE: 没有批次映射表，请提供 --map 或 --game-baseline')
+        table = load_baseline_map(known)
+    destination = Path(output) if output else None
+    bem.require(destination is None or not destination.is_file(), 'SET-BASELINE: 输出应是目录')
+    records = []
+    counts = dict(written=0, pending=0, skipped=0, unmatched=0, failed=0)
+    for path in files:
+        record = dict(file=str(path), action='', revision='', baseline=None, message='')
+        try:
+            manifest, _ = bem.read_package(path, decode=False)
+            revision = str((manifest.get('target') or {}).get('revision', ''))
+            record['revision'] = revision
+            if 'game_baseline' in manifest:
+                record.update(action='skipped', baseline=manifest['game_baseline'], message='已记录')
+            else:
+                chosen = baseline if baseline is not None else (table or {}).get(revision)
+                if chosen is None:
+                    record.update(action='unmatched', message='revision 不在批次表')
+                elif dry_run:
+                    record.update(action='pending', baseline=chosen)
+                else:
+                    target = None
+                    if destination is not None:
+                        destination.mkdir(parents=True, exist_ok=True)
+                        target = destination / path.name
+                    written = bem.set_game_baseline(path, chosen, output=target)
+                    record.update(action='written' if written else 'skipped', baseline=chosen)
+        except Exception as error:
+            record.update(action='failed', message=str(error))
+        counts[record['action']] += 1
+        records.append(record)
+    return dict(files=records, dry_run=dry_run, **counts)
+
+
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == 'compose':
+        from bem_compose_cli import main as compose_main
+        return compose_main(raw_argv[1:])
+    # Keep the established single-command CLI while also accepting the more
+    # discoverable `workspace init ROOT --source INPUT` spelling.
+    if len(raw_argv) >= 2 and raw_argv[0] == 'workspace' and raw_argv[1] == 'init':
+        raw_argv = ['init-workspace', *raw_argv[2:]]
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command',choices=['inspect','convert','validate','pack','pack-zip','unpack','bundle','new-project','build',
+                                           'init-workspace','workspace-init','target-profile','set-baseline'])
+    parser.add_argument('--version', action='version', version='BEM Tools '+TOOL_VERSION+' / BEM 1.0+1.1+1.2+1.3+1.4+1.5')
+    parser.add_argument('source',type=Path)
+    parser.add_argument('additional',type=Path,nargs='*',help='Additional BEM files for bundle only')
+    parser.add_argument('--recipe',type=Path)
+    parser.add_argument('--spec', type=Path, help='Exact resource target specification for target-profile')
+    parser.add_argument('--project', type=Path, help='Optional keep-only project output for target-profile')
+    parser.add_argument('--source',dest='workspace_source',type=Path,
+                        help='Input source for init-workspace; positional source is the workspace directory')
+    parser.add_argument('--deformations',type=Path,help='Author position-morph inputs saved in the export project')
+    parser.add_argument('--resource', help='BEM 1.4 resource ID for inspect/validate selected-plan output')
+    parser.add_argument('--platform', choices=['windows-x64', 'android-arm64'],
+                        help='BEM 1.4 platform for inspect/validate selected-plan output')
+    parser.add_argument('--ini')
+    parser.add_argument('-o','--output',type=Path)
+    parser.add_argument('--report',type=Path)
+    parser.add_argument('--mode', choices=['convert', 'pack'], default='convert', help='Export mode for new-project')
+    parser.add_argument('--export-output', type=Path, help='BEM output saved in new-project')
+    parser.add_argument('--package-id')
+    parser.add_argument('--name')
+    parser.add_argument('--author')
+    parser.add_argument('--package-version')
+    parser.add_argument('--preview', type=Path, help='Optional preview.png embedded in a pack-zip package')
+    parser.add_argument('--game-baseline',
+                        help='Game version baseline for new packages, e.g. '
+                             'windows-x64=1.6.3,android-arm64=1.6.4,hotfix=0. '
+                             'Defaults to the catalog `game` entry; all three values are required.')
+    parser.add_argument('--map', type=Path,
+                        help='Revision batch table for set-baseline; defaults to config/game-baseline-map.json')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='set-baseline reports what it would write without touching any file')
+    args=parser.parse_args(raw_argv)
+    result=dict(tool_version=TOOL_VERSION,format_version='1.0/1.1/1.2/1.3/1.4/1.5',command=args.command,source=str(args.source),success=False,conversion_ready=False,render_verified=False,issues=[])
+    report_path = args.report
+    protected_paths = [args.source, *args.additional] + ([args.output] if args.output else []) + ([args.recipe] if args.recipe else [])
+    if args.deformations: protected_paths.append(args.deformations)
+    if args.spec: protected_paths.append(args.spec)
+    if args.project: protected_paths.append(args.project)
+    try:
+        shape_input = args.deformations
+        if shape_input is None and args.recipe and args.command == 'convert':
+            recipe_data = bem.load_json(args.recipe)
+            if recipe_data.get('deformations'):
+                shape_input = args.recipe.resolve().parent / recipe_data['deformations']
+        if shape_input:
+            from bem_v13 import author_input_paths
+            protected_paths.extend(author_input_paths(shape_input))
+        bem.require(not args.additional or args.command=='bundle', 'Additional inputs are only valid for bundle')
+        bem.require(not (args.spec or args.project) or args.command == 'target-profile',
+                    'Spec/project arguments apply only to target-profile')
+        bem.require(not (args.resource or args.platform) or args.command in ('inspect', 'validate'),
+                    'Resource/platform filters apply only to inspect/validate')
+        if args.report:
+            paths=protected_paths
+            bem.require(all(args.report.resolve()!=p.resolve() for p in paths), 'Report cannot overwrite input/output/recipe')
+        if args.command in ('init-workspace', 'workspace-init'):
+            import bem_tasks
+            bem.require(args.workspace_source, 'SOURCE: workspace 初始化需要 --source 输入路径')
+            package = {key: value for key, value in (('id', args.package_id), ('name', args.name),
+                       ('author', args.author), ('version', args.package_version)) if value is not None}
+            result.update(bem_tasks.init_workspace(args.source, args.workspace_source, args.mode,
+                                                   args.recipe, package, args.deformations, args.export_output))
+        elif args.command == 'new-project':
+            import bem_tasks
+            bem.require(args.output, 'OUTPUT: 缺少工程文件路径')
+            package = {key: value for key, value in (('id', args.package_id), ('name', args.name),
+                       ('author', args.author), ('version', args.package_version)) if value is not None}
+            result.update(bem_tasks.new_project(args.source, args.output, args.mode, args.recipe, package, args.export_output, args.deformations))
+        elif args.command == 'build':
+            import bem_tasks
+            bem.require(not args.output and not args.recipe and not args.deformations, 'BUILD: 输出、配方和形态数据由工程文件保存，请编辑工程')
+            task = bem_tasks.load_task(args.source)
+            protected_paths.extend([*task['input_paths'], task['output']])
+            report_path = args.report or task['report']
+            bem.require(report_path is None or report_path.resolve() not in {p.resolve() for p in protected_paths},
+                        'Report cannot overwrite project/input/output/recipe')
+            result.update(bem_tasks.build_task(task))
+        elif args.command == 'target-profile':
+            from build_bem14_target import create_profile
+            bem.require(args.spec and args.output, 'Target profile requires --spec and --output')
+            result.update(create_profile(args.source, args.spec, args.output, args.project))
+        elif args.command=='inspect': result.update(inspect_source(args.source,args.ini))
+        elif args.command=='validate':
+            minor=bem.package_minor(args.source)
+            m,payloads=bem.read_package(args.source); selection_space=check_geometry(m,payloads,minor or None)
+            result.update(package=m,size=args.source.stat().st_size,format_version=FORMAT_VERSIONS[minor])
+            if 'option_groups' in m:
+                result['selection_space']=selection_space
+        elif args.command == 'set-baseline':
+            result['backfill'] = backfill_baselines(
+                args.source,
+                bem.parse_game_baseline(args.game_baseline) if args.game_baseline else None,
+                args.map, args.dry_run, args.output)
+        elif args.command in ('pack','unpack','bundle','pack-zip'):
+            bem.require(args.output, 'OUTPUT: 缺少输出路径')
+            if args.command=='pack': result.update(bem_projects.pack_project(args.source,args.output,deformations=args.deformations,game_baseline=args.game_baseline))
+            elif args.command=='unpack': result.update(bem_projects.unpack(args.source,args.output))
+            elif args.command=='pack-zip':
+                result.update(bem_projects.pack_zip(args.source,args.output,preview=args.preview))
+            else: result.update(bem_projects.bundle([args.source,*args.additional],args.output))
+        else:
+            bem.require(args.output,'OUTPUT: 请选择输出文件')
+            bem.require(args.source.resolve()!=args.output.resolve(),'OUTPUT: 不能覆盖源文件')
+            result.update(convert(args.source,args.recipe,args.output,deformations=args.deformations,game_baseline=args.game_baseline) if args.recipe else
+                          convert_automatic(args.source,args.output,args.ini,deformations=args.deformations,game_baseline=args.game_baseline))
+        if args.resource or args.platform:
+            import bem_v14
+            manifest = result.get('package')
+            bem.require(manifest is not None and bem_v14.used(manifest), 'Resource filtering requires BEM 1.4')
+            result['selection_plan'] = bem_v14.selection_plan(manifest, resource=args.resource, platform=args.platform)
+        result['success']=True
+    except Exception as exc:
+        result['issues'].append(dict(code='CONVERSION_FAILED',message=str(exc),
+            hint='核对入口、已验证角色 profile、骨骼/材质映射和源文件版本；特殊 Shader 需要审阅配方。'))
+    encoded=json.dumps(result,ensure_ascii=False,indent=2,allow_nan=False)
+    if report_path and all(report_path.resolve()!=p.resolve() for p in protected_paths):
+        bem.atomic_write(report_path,encoded.encode('utf-8'))
+    print(encoded)
+    return 0 if result['success'] else 2
+
+
+if __name__=='__main__':
+    if hasattr(sys.stdout,'reconfigure'): sys.stdout.reconfigure(encoding='utf-8')
+    raise SystemExit(main())
